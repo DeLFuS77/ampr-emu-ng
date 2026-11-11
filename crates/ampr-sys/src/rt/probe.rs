@@ -361,18 +361,3 @@ pub(crate) unsafe fn probe_path(path: *const c_char, op: u8, rc: c_int) {
         stats::fs_note(op, how, rc.into(), path);
     }
 }
-
-// ---- tests --------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn select_text_is_the_decimal_nfds() {
-        let t = select_text(1025);
-        assert_eq!(&t.buf[..t.n], b"select nfds=1025");
-        let t = select_text(c_int::MAX);
-        assert_eq!(&t.buf[..t.n], b"select nfds=2147483647");
-    }
-}

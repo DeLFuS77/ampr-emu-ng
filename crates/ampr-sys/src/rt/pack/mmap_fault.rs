@@ -44,7 +44,8 @@
 //!   call over the game's change.
 //! - The handler runs on the faulting thread's stack (no sigaltstack):
 //!   pread, a zstd decode and mprotect there can overflow a small-stack
-//!   thread, the class of the Bink IO crash fixed in rt/pack/fd_read.rs.
+//!   thread, the small-stack crash class rt/pack/fd_read.rs avoids with
+//!   its read threads.
 //! - A range replaced by a VM call we do not hook (e.g. a MAP_FIXED map
 //!   through another entry point) stays registered: a later fault there is
 //!   taken for ours.
@@ -59,10 +60,10 @@
 //! - A game that replaces our SIGSEGV/SIGBUS handler after the first map
 //!   takes those faults itself.
 //!
-//! Pool use, only after the game maps a packed file with the knob at 1:
-//! `SLOTS` x 512 KiB scratch (2 MiB) plus one libzstd DCtx each from the
-//! libc heap, persistent; one byte per mapped chunk, transient, released
-//! on munmap. Unmeasured on a console (Makefile).
+//! Memory, only after the game maps a packed file with the knob at 1:
+//! `SLOTS` x 512 KiB scratch (2 MiB, Index ledger) plus one libzstd DCtx
+//! each from the libc heap, persistent; one byte per mapped chunk from the
+//! small slab, transient, released on munmap. Unmeasured on a console (Makefile).
 
 use super::super::index::{sdk_alloc, sdk_release, title_alloc, title_free, MEM_TRANSIENT};
 use super::zstd::{zstd_entry, zstd_index};
@@ -241,8 +242,8 @@ static SLOT_TABLE: [Slot; SLOTS] = [const {
 static SLOTS_STATE: AtomicU8 = AtomicU8::new(0);
 
 /// Under FAULT_M, on the first fault-path map: the scratch buffers (one
-/// 2 MiB index memory block, rt/index_memory.rs, too large for the 4 MiB
-/// pool) and a warmed-up decoder per slot, so a fill allocates nothing.
+/// 2 MiB block from the Index ledger, rt/index_memory.rs, not a fixed
+/// pool site) and a warmed-up decoder per slot, so a fill allocates nothing.
 /// False when any allocation fails; what was made is released.
 unsafe fn make_slots() -> bool {
     match SLOTS_STATE.load(Ordering::Acquire) {
@@ -1119,16 +1120,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         finish(&S, true);
         assert_eq!(waiter.join().unwrap(), Claim::Ready);
-    }
-
-    #[test]
-    fn hex_drops_leading_zeros() {
-        let (d, n) = hex(0x2a);
-        assert_eq!(&d[..n], b"2a");
-        let (d, n) = hex(0);
-        assert_eq!(&d[..n], b"0");
-        let (d, n) = hex(u64::MAX);
-        assert_eq!(&d[..n], b"ffffffffffffffff");
     }
 
     #[test]

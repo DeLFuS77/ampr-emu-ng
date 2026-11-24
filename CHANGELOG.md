@@ -14,3 +14,10 @@ The first public release of MaxPack's copy of
   reads `ampr-emu-ng: v0.5.1 (p5z) running`. A game without a `maxpack.image` runs exactly as with
   upstream.
 - Release files: `libSceAmpr.sprx`, `libSceAmpr-debug.sprx` and `SHA256SUMS`.
+
+**Legal.** MaxPack is for backups of games you own. It includes no games, firmware, keys or other
+copyrighted content, does not help to obtain them and does not bypass encryption, keys or DRM;
+piracy is not supported. It is provided "as is", without warranty, under the GPL-3.0-or-later: use
+it at your own risk. The authors are not responsible for data loss, lost saves, damage to the
+console or storage, bans or any other problem. MaxPack is not affiliated with or endorsed by Sony
+Interactive Entertainment. Full text: [Legal and disclaimer](README.md#legal-and-disclaimer).

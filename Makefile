@@ -88,7 +88,12 @@ AMPR_MEM_REPORT ?= 0
 # Directory fds as plain numbers (320 packed slots instead of 512, a live
 # flag per directory slot, no directory generation) took 128 B (release) and
 # 384 B (debug) off them; both totals stayed 168.52 MiB, 472 B apart (728 B
-# before). `dist` checks both totals
+# before).
+# p5z mode (rt/pack/p5z.rs: the start-up check, 16689 B of .bss for its
+# region table and maxpack.image, and 8 B more in each of the 1024 pack
+# handles) grew the totals from 158212666 B (release) and 158227746 B
+# (debug) to 158254570 B and 158256370 B, 1800 B apart (15080 before),
+# from CI's `dist`; the pools stay as they were. `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay at most 256 MiB, else recompute the debug pool here.
 # The first pool allocation publishes the pool (mprotect), so the startup

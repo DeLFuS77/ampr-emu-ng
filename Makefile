@@ -95,7 +95,9 @@ AMPR_MEM_REPORT ?= 0
 # region table and maxpack.image, and 8 B more in each of the 1024 pack
 # handles) grew the totals from 158212666 B (release) and 158227746 B
 # (debug) to 158254570 B and 158256370 B, 1800 B apart (15080 before),
-# from CI's `dist`; the pools stay as they were. `dist` checks both totals
+# from CI's `dist`; the pools stay as they were. With v0.5.1 (lane EOP
+# overlap, the debug pool at 0x8ECC000) they are 158258458 B and
+# 158259082 B, 624 B apart, from CI's `dist`. `dist` checks both totals
 # (tools/verify_payload_prx.py --prx-totals): they must match within 64 KiB
 # and stay at most 256 MiB, else recompute the debug pool here.
 # The first pool allocation publishes the pool (mprotect), so the startup

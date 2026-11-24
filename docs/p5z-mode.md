@@ -61,7 +61,7 @@ p5z/basic.p5z
 that is `"maxpack-image 1\np5z/basic.p5z\n0 1234 5678\n"`. A second test on
 each side checks a UTF-8 name, the payload writing and ampr-emu-ng reading
 exactly
-`"maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 1234 5678\n"`.
+`"maxpack-image 1\np5z/Starfall’s Odyssey™ 2 [PPSA01234].p5z\n0 1234 5678\n"`.
 Anything else is refused: text that is not UTF-8, another first line, a
 missing path, a path that is not `p5z/` and one name as above, ids that do
 not start at 0 or skip or repeat or come out of order, no volumes or more

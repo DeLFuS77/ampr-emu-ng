@@ -231,14 +231,14 @@ mod tests {
     /// test writes this exact text. A UTF-8 name as MaxPack's PC app names
     /// a `.p5z` ("<Title> [<TITLE_ID>].p5z").
     const GOLDEN_UTF8: &str =
-        "maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 1234 5678\n";
+        "maxpack-image 1\np5z/Starfall’s Odyssey™ 2 [PPSA01234].p5z\n0 1234 5678\n";
 
     #[test]
     fn image_golden_utf8_parses() {
         let (path, n, r) = parse(GOLDEN_UTF8.as_bytes()).unwrap();
         assert_eq!(
             path,
-            "p5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z".as_bytes()
+            "p5z/Starfall’s Odyssey™ 2 [PPSA01234].p5z".as_bytes()
         );
         assert_eq!(
             (n, r),

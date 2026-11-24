@@ -610,13 +610,13 @@ mod tests {
 
     /// The name MaxPack's PC app gives a `.p5z` ("<Title> [<TITLE_ID>].p5z")
     /// keeps the title's ™, ’ and accents: the check opens it as it is.
-    const UTF8_GAME: &CStr = c"/app0/p5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z";
+    const UTF8_GAME: &CStr = c"/app0/p5z/Starfall’s Odyssey™ 2 [PPSA01234].p5z";
 
     #[test]
     fn p5z_check_passes_a_utf8_name() {
         let mut disk = Mem::game();
         let text = format!(
-            "maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 {START} {LEN}\n"
+            "maxpack-image 1\np5z/Starfall’s Odyssey™ 2 [PPSA01234].p5z\n0 {START} {LEN}\n"
         );
         *disk.bytes(P5Z_IMAGE) = text.into_bytes();
         disk.file(GAME).0 = UTF8_GAME;

@@ -2,6 +2,30 @@
 
 A hard fork of [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), built to run PKG, zstd, LZ4 and plain games quickly and reliably.
 
+## This copy
+
+This repository is MaxPack's copy of
+[quer3q/ampr-emu-ng](https://github.com/quer3q/ampr-emu-ng), the original
+project by quer3q. It follows upstream and adds one mode, **p5z**: the zstd
+volumes of a game are read straight from inside one `.p5z` file, so the
+PS5 needs no `.pak` files next to the game
+([docs/p5z-mode.md](docs/p5z-mode.md)). A game without a `maxpack.image`
+runs exactly as with upstream.
+
+- [MaxPack](https://github.com/DeLFuS77/maxpack) is the PC tool that packs
+  a game into a `.p5z`, and has the user guide (in Spanish).
+- [maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5) is the PS5 payload
+  that mounts a `.p5z` game, writes its `maxpack.image` and ships this
+  `libSceAmpr.sprx`.
+
+Releases of this copy are named `v<upstream version>-maxpack.<n>`, for
+example `v0.5.1-maxpack.1`: the upstream version it is built on and a
+MaxPack revision. The launch notice shows the upstream part only
+(`ampr-emu-ng: v0.5.1 (p5z) running`). Download them from
+[Releases](https://github.com/DeLFuS77/ampr-emu-ng/releases), with
+`SHA256SUMS`. Report a problem with a `.p5z` game here; a problem that also
+happens with upstream's build belongs to upstream.
+
 ## How to
 
 ### Use
@@ -15,13 +39,16 @@ with only loose files.
 
 A PKG game runs through [kraken-mount](https://github.com/quer3q/kraken-mount),
 the PKG launcher, which copies `libSceAmpr.sprx` into the game's `fakelib/`
-itself.
+itself. A `.p5z` game runs through
+[maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5), which does the same
+with its own copy of this build.
 
 ### Make packs
 
 [ps5-dump-forge](https://github.com/quer3q/ps5-dump-forge) builds PKGs, zstd
-packs and LZ4 packs. Other tools that write the same formats should work too,
-but are untested.
+packs and LZ4 packs. [MaxPack](https://github.com/DeLFuS77/maxpack) builds
+zstd packs and the `.p5z` that holds them. Other tools that write the same
+formats should work too, but are untested.
 
 ### Build
 
@@ -41,11 +68,16 @@ copies two files to the project root:
   failure logs, for testing ([docs/debug-build.md](docs/debug-build.md)).
 
 Every push to main also publishes both files as the
-[beta pre-release](https://github.com/quer3q/ampr-emu-ng/releases/tag/beta);
+[beta pre-release](https://github.com/DeLFuS77/ampr-emu-ng/releases/tag/beta);
 its launch notice reads `v<version>-beta.<commit>`.
+
+Design notes, the memory budget, the PRX size rule and how a change is
+checked are in [DESIGN.md](DESIGN.md).
 
 ## Thanks
 
+- [quer3q/ampr-emu-ng](https://github.com/quer3q/ampr-emu-ng), the
+  project this copy follows; everything but the p5z mode is upstream's.
 - [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), the C++ AMPR
   emulator this project ports.
 - [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk), the PS5

@@ -3,7 +3,7 @@
 use ampr_format::p5z::{
     check_header, check_region, file_offset, parse_image, P5zError, Region, MAX_VOLUMES,
 };
-use ampr_format::zstd::{volume_header, Index};
+use ampr_format::zstd::{header_volumes, volume_header, volume_header_for, Index};
 
 const P5Z: &[u8] = include_bytes!("fixtures/p5z/basic.p5z");
 const INDEX: &[u8] = include_bytes!("fixtures/p5z/ampr_zstd.index");
@@ -69,4 +69,25 @@ fn fixture_truncated_refused() {
     // The real file holds the region, the index and the footer.
     assert!(P5Z.len() as u64 >= end + 32);
     check_region(0, r, end + 32, size).unwrap();
+}
+
+#[test]
+fn fixture_checks_without_a_mounted_index() {
+    // What the PS5 checks at start-up, before ampr_zstd.index is mounted:
+    // the index header, its volume table and each volume header.
+    let index = Index::open(INDEX).unwrap();
+    let v = header_volumes(&INDEX[..128]).unwrap();
+    assert_eq!((v.count, &v.archive_id), (1, index.archive_id()));
+    let at = v.volumes_at as usize;
+    let size = u64::from_le_bytes(INDEX[at..at + 8].try_into().unwrap());
+    assert_eq!(size, index.volume_size(0).unwrap());
+    let r = region0();
+    check_header(&P5Z[..64], &v.archive_id).unwrap();
+    check_region(0, r, P5Z.len() as u64, size).unwrap();
+    let start = r.start as usize;
+    assert_eq!(
+        volume_header_for(&P5Z[start..start + 64], 0, v.count, &v.archive_id, size),
+        volume_header(&P5Z[start..start + 64], &index, 0)
+    );
+    assert!(volume_header_for(&P5Z[start..start + 64], 0, 1, &v.archive_id, size).is_ok());
 }

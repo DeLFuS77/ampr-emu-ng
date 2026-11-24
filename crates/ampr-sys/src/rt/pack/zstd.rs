@@ -59,7 +59,8 @@ const _: () = assert!(
     )
 );
 
-const fn ends_with(path: &[u8], name: &[u8]) -> bool {
+/// True when `path` ends with `/` and `name`.
+pub(super) const fn ends_with(path: &[u8], name: &[u8]) -> bool {
     if path.len() <= name.len() || path[path.len() - name.len() - 1] != b'/' {
         return false;
     }

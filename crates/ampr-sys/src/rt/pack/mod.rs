@@ -135,6 +135,10 @@ pub(crate) use pack_split::*;
 /// Pkg mode: pack 0 read straight from the .pkg `/app0/kraken.image` names.
 mod pkg;
 pub(crate) use pkg::*;
+/// p5z mode: zstd volumes read from their regions in the .p5z that
+/// `/app0/maxpack.image` names.
+mod p5z;
+pub(crate) use p5z::*;
 
 // ---- pack format ----
 
@@ -163,7 +167,8 @@ impl PackFormat {
         }
     }
 
-    /// Name in the load notice, `/metrics` and the black box.
+    /// Name of the format alone; the load notice, `/metrics` and the black
+    /// box name the mode (`mode_label`), which tells p5z from zstd.
     pub(crate) const fn label(self) -> &'static [u8] {
         match self {
             Self::Plain => b"plain",
@@ -184,6 +189,40 @@ impl PackFormat {
     pub(crate) const fn has_packs(self) -> bool {
         !matches!(self, Self::Plain)
     }
+}
+
+/// Longest mode label (`plain`), for the load notice (exports.rs).
+pub(crate) const MODE_LABEL_MAX: usize = 5;
+const _: () = {
+    let labels = [
+        PackFormat::Plain.label(),
+        PackFormat::Lz4.label(),
+        PackFormat::Zstd.label(),
+        PackFormat::Pkg.label(),
+        P5Z_LABEL,
+    ];
+    let mut i = 0;
+    while i < labels.len() {
+        assert!(labels[i].len() <= MODE_LABEL_MAX);
+        i += 1;
+    }
+};
+const P5Z_LABEL: &[u8] = b"p5z";
+
+/// The mode of `format`: `p5z` for zstd packs read from a .p5z (`p5z`
+/// active), else the format's label.
+const fn label_for(format: PackFormat, p5z: bool) -> &'static [u8] {
+    if format.is_zstd() && p5z {
+        P5Z_LABEL
+    } else {
+        format.label()
+    }
+}
+
+/// Name of this title's mode in the load notice, `/metrics` and the black
+/// box: plain, lz4, zstd, pkg or p5z.
+pub(crate) fn mode_label() -> &'static [u8] {
+    label_for(pack_format(), p5z_active())
 }
 
 static PACK_FORMAT: AtomicU8 = AtomicU8::new(PackFormat::Plain as u8);
@@ -344,8 +383,16 @@ pub(crate) unsafe fn select_pack_format() {
     };
     // A title without /app0/kraken.image costs one failed open. A pkg
     // title wins over a zstd index also present: its manifest is AMPRPAK4.
+    // p5z comes before zstd because a p5z title has ampr_zstd.index too:
+    // without the check it would be a zstd title whose .pak files are
+    // missing. A failed p5z check keeps zstd, serves no packed file and
+    // says why in the notice (p5z.rs); it never falls back to .pak files.
+    // A title without maxpack.image costs one failed stat.
     let format = if unsafe { discover_pkg() } {
         PackFormat::Pkg
+    } else if exists(P5Z_IMAGE) {
+        unsafe { discover_p5z() };
+        PackFormat::Zstd
     } else if exists(zstd::AMPR_EMU_ZSTD_INDEX_PATH) {
         PackFormat::Zstd
     } else if exists(AMPR_EMU_PACK_INDEX_PATH) {
@@ -1148,8 +1195,12 @@ pub(crate) struct PackHandle {
     pub fd: c_int,
     pub pins: u32,
     pub last_use: u64,
+    /// I/O range in volume offsets (the chunk offsets of the index).
     pub payload_begin: u64,
     pub payload_end: u64,
+    /// File offset of volume byte 0: the volume's region start in the
+    /// .p5z (p5z mode), else 0. Added to each read's offset (window_aio.rs).
+    pub base: u64,
     pub opening: bool,
     /// Stale-fd reopen state (leases.rs `PackFdReopen`). Kept across
     /// eviction so a reopened fd keeps its one-retry bound.
@@ -1162,6 +1213,7 @@ impl PackHandle {
         last_use: 0,
         payload_begin: 0,
         payload_end: 0,
+        base: 0,
         opening: false,
         reopen: PackFdReopen::Clean,
     };
@@ -1579,6 +1631,24 @@ mod tests {
         assert_eq!(pack_format(), PackFormat::Plain);
         assert!(!zstd_mode() && !pkg_mode());
         assert!(!packs_present());
+        assert_eq!(mode_label(), b"plain");
+    }
+
+    /// p5z modifies zstd only: the label of every other format stays.
+    #[test]
+    fn mode_label_says_p5z() {
+        assert_eq!(label_for(PackFormat::Zstd, true), b"p5z");
+        assert_eq!(label_for(PackFormat::Zstd, false), b"zstd");
+        for f in [PackFormat::Plain, PackFormat::Lz4, PackFormat::Pkg] {
+            assert_eq!(label_for(f, true), f.label(), "{f:?}");
+            assert_eq!(label_for(f, false), f.label(), "{f:?}");
+        }
+    }
+
+    /// A volume that is its own file is read from byte 0 of it.
+    #[test]
+    fn pack_handle_starts_without_base() {
+        assert_eq!(PackHandle::EMPTY.base, 0);
     }
 
     #[test]

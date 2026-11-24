@@ -158,35 +158,82 @@ const BETA_REV: &str = match (option_env!("AMPR_BETA"), option_env!("AMPR_GIT_RE
     (Some(b), Some(rev)) if b.len() == 1 && b.as_bytes()[0] == b'1' => rev,
     _ => "",
 };
-// The notice buffer is 64 bytes; "-dirty" hashes are 13.
+// "-dirty" hashes are 13.
 const _: () = assert!(BETA_REV.len() <= 16, "AMPR_GIT_REV too long for the notice");
 
-/// "ampr-emu-ng: v<version>[-beta.<rev>] (<mode>) running" into `out`; its
-/// length. Mode:
-/// "zstd" (ampr_zstd.index), "pkg" (this title's .pkg in /app0/kraken/), "lz4"
-/// (ampr_assets.index) or "plain" (no packs, loose files only).
-fn load_notice(mode: &[u8], out: &mut [u8; 64]) -> usize {
-    let mut n = 0;
-    for part in [
-        b"ampr-emu-ng: v" as &[u8],
-        VERSION.as_bytes(),
-        if BETA_REV.is_empty() { b"" } else { b"-beta." },
-        BETA_REV.as_bytes(),
-        b" (",
-        mode,
-        b") running",
-    ] {
-        out[n..n + part.len()].copy_from_slice(part);
-        n += part.len();
+/// The launch notice line, in bytes. Both lines fit with room to spare
+/// (asserts below), and `put_notice` cuts a part that would not, so no
+/// write can pass the buffer.
+const NOTICE_MAX: usize = 96;
+const LOAD_PREFIX: &[u8] = b"ampr-emu-ng: v";
+const BETA_DASH: &[u8] = b"-beta.";
+const RUNNING: &[u8] = b") running";
+const P5Z_PREFIX: &[u8] = b"ampr-emu-ng: p5z: ";
+const P5Z_SUFFIX: &[u8] = b"; packed files not served";
+// The longest load notice: this version, a 16-byte beta rev, the longest
+// mode label.
+const _: () = assert!(
+    LOAD_PREFIX.len()
+        + VERSION.len()
+        + BETA_DASH.len()
+        + 16
+        + b" (".len()
+        + super::pack::MODE_LABEL_MAX
+        + RUNNING.len()
+        <= NOTICE_MAX
+);
+// The longest p5z failure notice.
+const _: () =
+    assert!(P5Z_PREFIX.len() + super::pack::P5Z_REASON_MAX + P5Z_SUFFIX.len() <= NOTICE_MAX);
+
+/// Appends `parts` to `out[..n]`; the new length. A part that does not fit
+/// is cut at NOTICE_MAX: `n` never passes it.
+fn put_notice(out: &mut [u8; NOTICE_MAX], mut n: usize, parts: &[&[u8]]) -> usize {
+    for part in parts {
+        let take = part.len().min(NOTICE_MAX.saturating_sub(n));
+        if let (Some(dst), Some(src)) = (out.get_mut(n..n + take), part.get(..take)) {
+            dst.copy_from_slice(src);
+            n += take;
+        }
     }
     n
+}
+
+/// "ampr-emu-ng: v<version>[-beta.<rev>] (<mode>) running" into `out`; its
+/// length. Mode (pack/mod.rs `mode_label`): "zstd" (ampr_zstd.index),
+/// "p5z" (the zstd volumes in the .p5z that maxpack.image names), "pkg"
+/// (this title's .pkg in /app0/kraken/), "lz4" (ampr_assets.index) or
+/// "plain" (no packs, loose files only).
+fn load_notice(
+    version: &[u8],
+    beta: Option<&[u8]>,
+    mode: &[u8],
+    out: &mut [u8; NOTICE_MAX],
+) -> usize {
+    let (dash, rev) = beta.map_or((&b""[..], &b""[..]), |rev| (BETA_DASH, rev));
+    put_notice(
+        out,
+        0,
+        &[LOAD_PREFIX, version, dash, rev, b" (", mode, RUNNING],
+    )
+}
+
+/// "ampr-emu-ng: p5z: <reason>; packed files not served" into `out`, in
+/// place of the load notice when the p5z start-up check failed; its length.
+fn p5z_failure_notice(reason: &[u8], out: &mut [u8; NOTICE_MAX]) -> usize {
+    put_notice(out, 0, &[P5Z_PREFIX, reason, P5Z_SUFFIX])
+}
+
+/// BETA_REV for `load_notice`: None on a release build.
+fn beta_rev() -> Option<&'static [u8]> {
+    (!BETA_REV.is_empty()).then_some(BETA_REV.as_bytes())
 }
 
 #[cfg(test)]
 #[test]
 fn load_notice_names_the_beta_rev() {
-    let mut out = [0u8; 64];
-    let n = load_notice(b"plain", &mut out);
+    let mut out = [0u8; NOTICE_MAX];
+    let n = load_notice(VERSION.as_bytes(), beta_rev(), b"plain", &mut out);
     let beta = if BETA_REV.is_empty() {
         String::new()
     } else {
@@ -198,12 +245,66 @@ fn load_notice_names_the_beta_rev() {
     );
 }
 
-/// Tells the owner the module runs; also keeps AMPR_EMU_VERSION linked.
+/// A payload build's version and a 16-byte beta rev with the p5z mode fit,
+/// whole, though the crates stay at their own version.
+#[cfg(test)]
+#[test]
+fn load_notice_fits_beta_and_p5z() {
+    let mut out = [0u8; NOTICE_MAX];
+    let rev = b"0123456789abcdef";
+    let n = load_notice(b"0.5.0-maxpack.2", Some(rev), b"p5z", &mut out);
+    let want = b"ampr-emu-ng: v0.5.0-maxpack.2-beta.0123456789abcdef (p5z) running";
+    assert_eq!(out[..n], want[..]);
+    assert!(n < NOTICE_MAX && out[..n].ends_with(b"(p5z) running"));
+    let n = load_notice(b"0.5.0-maxpack.2", None, b"p5z", &mut out);
+    assert_eq!(out[..n], b"ampr-emu-ng: v0.5.0-maxpack.2 (p5z) running"[..]);
+}
+
+/// Every p5z failure notice fits whole; a line too long is cut at the
+/// buffer's end, never past it.
+#[cfg(test)]
+#[test]
+fn p5z_failure_notice_fits_and_long_lines_are_cut() {
+    use super::pack::P5zFail;
+    use ampr_format::p5z::P5zError;
+    let mut out = [0u8; NOTICE_MAX];
+    for f in [
+        P5zFail::Check(P5zError::Image("x")),
+        P5zFail::Check(P5zError::Header("x")),
+        P5zFail::Check(P5zError::ArchiveId),
+        P5zFail::Check(P5zError::Region(7)),
+        P5zFail::Check(P5zError::Volume(7)),
+        P5zFail::Index,
+        P5zFail::Open,
+    ] {
+        let n = p5z_failure_notice(f.reason(), &mut out);
+        let reason = core::str::from_utf8(f.reason()).unwrap();
+        let want = format!("ampr-emu-ng: p5z: {reason}; packed files not served");
+        assert_eq!(out[..n], *want.as_bytes(), "{f:?}");
+        assert!(n < NOTICE_MAX);
+    }
+    let long = [b'9'; 200];
+    assert_eq!(load_notice(&long, Some(&long), b"p5z", &mut out), NOTICE_MAX);
+    assert_eq!(out[..LOAD_PREFIX.len()], *LOAD_PREFIX);
+    assert_eq!(p5z_failure_notice(&long, &mut out), NOTICE_MAX);
+    assert_eq!(put_notice(&mut out, NOTICE_MAX, &[b"x"]), NOTICE_MAX);
+}
+
+/// Tells the owner the module runs, or after a failed p5z check that the
+/// packed files are not served; also keeps AMPR_EMU_VERSION linked.
 unsafe fn notify_loaded() {
     let _ = unsafe { core::ptr::read_volatile(&raw const AMPR_EMU_VERSION) };
-    let mut text = [0u8; 64];
-    let n = load_notice(super::pack::pack_format().label(), &mut text);
-    unsafe { notify(&text[..n]) };
+    let mut text = [0u8; NOTICE_MAX];
+    let n = match super::pack::p5z_failure() {
+        Some(fail) => p5z_failure_notice(fail.reason(), &mut text),
+        None => load_notice(
+            VERSION.as_bytes(),
+            beta_rev(),
+            super::pack::mode_label(),
+            &mut text,
+        ),
+    };
+    unsafe { notify(text.get(..n).unwrap_or(&text)) };
 }
 
 // ---- /bench query parsing and region planning ---------------------------
@@ -883,7 +984,7 @@ mod mem_report {
     /// not warm the OS cache for later ones. Blocks only the metrics thread.
     unsafe fn bench_volume(out: &mut Text) {
         let mut path = [0u8; 1024];
-        let Some((len, size)) = (unsafe { bench_volume_path(&mut path) }) else {
+        let Some((len, size, base)) = (unsafe { bench_volume_path(&mut path) }) else {
             out.s(b"bench: manifest not ready (loose game: /bench?path=/app0/<file>)\n");
             return;
         };
@@ -896,6 +997,8 @@ mod mem_report {
             .s(&path[..len])
             .s(b" file_size=")
             .u(size)
+            .s(b" base=")
+            .u(base)
             .s(b"\n");
         let Some((buf, cap)) = (unsafe { alloc_buf(256 * KIB) }) else {
             out.s(b"bench: buffer alloc failed\n");
@@ -921,7 +1024,11 @@ mod mem_report {
                 stride.min(32 * MIB as u64)
             };
             for (i, &(name, req, qd)) in TESTS.iter().enumerate() {
-                let off = i as u64 * stride;
+                // Volume offsets from `base`: in a .p5z volume 0 starts
+                // at its region (the regions are aligned in the volume).
+                let Some(off) = base.checked_add(i as u64 * stride) else {
+                    break;
+                };
                 let (req, qd) = bench_args::fit(req, qd, cap);
                 let r = if qd == 0 {
                     unsafe { bench_pread(fd, buf.cast(), req, off, bytes) }
@@ -1201,9 +1308,9 @@ mod mem_report {
             .s(b" ")
             .s(super::BUILD_FLAVOR.as_bytes())
             .s(b"\n");
-        // Pack format (load notice mode): plain, lz4, zstd or pkg.
+        // Load notice mode: plain, lz4, zstd, pkg or p5z.
         out.s(b"pack_format ")
-            .s(super::super::pack::pack_format().label())
+            .s(super::super::pack::mode_label())
             .s(b"\n");
         out.kv("uptime_ns", monotonic_ns().saturating_sub(start_ns))
             .kv("pool_used_bytes", used as u64)
@@ -1581,6 +1688,8 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     {
         unsafe { super::blackbox::open() };
         super::pack::log_discovery();
+        super::pack::log_p5z_discovery();
+        super::blackbox::mode(super::pack::mode_label());
         super::blackbox::rw(super::rw::app0_access_errno());
     }
     unsafe { notify_loaded() };

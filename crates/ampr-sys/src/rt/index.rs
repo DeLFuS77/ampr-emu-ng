@@ -1409,7 +1409,7 @@ unsafe fn add_dirent(
     }
     match unsafe { normalize_key(path_ptr, &mut ws.path_key) } {
         Some(klen)
-            if !is_kraken_key(&ws.path_key[..klen]) && !is_skipped_key(&ws.path_key[..klen]) => {}
+            if !is_mount_key(&ws.path_key[..klen]) && !is_skipped_key(&ws.path_key[..klen]) => {}
         _ => return true,
     }
     let path = &ws.path[..len];
@@ -2137,6 +2137,29 @@ fn kraken_key_shape(key: &[u8]) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
 }
 
+/// `/app0/p5z` and below, and `/app0/maxpack.image` (normalized key): the
+/// read-only mount of the folder that holds the .p5z (rt/pack/p5z.rs), the
+/// user's whole folder, which may hold other games' .p5z files, and the
+/// file that names it. Neither is the title's, so the walk skips them and
+/// lookups there go to the filesystem. Only in p5z mode: a folder title
+/// may ship its own `p5z` directory.
+fn is_p5z_key(key: &[u8]) -> bool {
+    super::pack::p5z_active() && p5z_key_shape(key)
+}
+
+fn p5z_key_shape(key: &[u8]) -> bool {
+    key == b"/app0/maxpack.image"
+        || key
+            .strip_prefix(b"/app0/p5z".as_slice())
+            .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
+}
+
+/// A mount the launcher or payload added to /app0 for this mode (pkg or
+/// p5z), not a file or folder of the title.
+fn is_mount_key(key: &[u8]) -> bool {
+    is_kraken_key(key) || is_p5z_key(key)
+}
+
 /// A `Miss` lookup that could not read the index: not authoritative, so
 /// the hook asks the real call (`io_miss`).
 fn io_lookup(r: &mut Lookup) {
@@ -2203,9 +2226,10 @@ unsafe fn lookup_resident(path: *const c_char, pbuf: &mut EntryPath, lazy: bool)
     };
     let (len, trailing) = (k.len, k.had_trailing_separator);
     let key = &buf[..len];
-    // The kraken mount is not the title's: an index built before the walk
-    // skipped it may still list it, so it goes to the filesystem unlooked.
-    if !is_app0_key(key) || is_kraken_key(key) {
+    // The kraken and p5z mounts are not the title's: an index built before
+    // the walk skipped them may still list them, so they go to the
+    // filesystem unlooked.
+    if !is_app0_key(key) || is_mount_key(key) {
         return r;
     }
     r.state = Resident::Miss;
@@ -3980,6 +4004,10 @@ pub(crate) mod tests {
         assert!(miss(c"/app0/kraken"));
         assert!(miss(c"/app0/Kraken/game.pkg"));
         assert!(miss(c"/app0/krakenx/a.bin"));
+        // Outside p5z mode a p5z dir and maxpack.image are the title's own.
+        assert!(!is_mount_key(b"/app0/p5z/game.p5z"));
+        assert!(miss(c"/app0/p5z/game.p5z"));
+        assert!(miss(c"/app0/maxpack.image"));
     }
 
     /// `/app0/kraken` and its subtree bypass the index, in any ASCII case
@@ -4007,6 +4035,43 @@ pub(crate) mod tests {
             c"/app0/krakenx",
             c"/app0/kraken.pkg",
             c"/app0/data/kraken/a.pkg",
+        ] {
+            assert!(!shape(no), "{no:?}");
+        }
+    }
+
+    /// `/app0/p5z` with its subtree and `/app0/maxpack.image` bypass the
+    /// index in p5z mode, in any ASCII case and spelling; siblings with the
+    /// same prefix and the same names elsewhere do not.
+    #[test]
+    fn p5z_key_shape_covers_the_mount_and_the_image() {
+        let shape = |p: &CStr| {
+            let mut key = [0u8; RUNTIME_PATH_CAPACITY];
+            unsafe { normalize_key(p.as_ptr(), &mut key) }
+                .is_some_and(|n| p5z_key_shape(&key[..n]))
+        };
+        for yes in [
+            c"/app0/p5z",
+            c"/app0/p5z/",
+            c"/app0/p5z/Game.p5z",
+            c"/APP0//P5Z/other/x.p5z",
+            c"/app0/x/../p5z/a.p5z",
+            c"/app0/maxpack.image",
+            c"/APP0/MaxPack.Image",
+        ] {
+            assert!(shape(yes), "{yes:?}");
+            // Not a service path: in p5z mode lookup_resident_path sends
+            // them to the filesystem before any miss handling.
+            assert!(!is_service_path(yes.as_ptr()), "{yes:?}");
+        }
+        for no in [
+            c"/app0/p5zx",
+            c"/app0/p5z.bin",
+            c"/app0/data/p5z/a.p5z",
+            c"/app0/maxpack.image2",
+            c"/app0/maxpack",
+            c"/app0/data/maxpack.image",
+            c"/app0/kraken",
         ] {
             assert!(!shape(no), "{no:?}");
         }

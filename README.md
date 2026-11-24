@@ -9,7 +9,9 @@ A hard fork of [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), built to
 Copy `libSceAmpr.sprx` into the game's `fakelib/`, mount the game with
 ShadowMountPlus and turn off fakelib updates in its settings. At launch the
 console shows `ampr-emu-ng: vx.x.x (zstd) running`, where the mode is `zstd`,
-`pkg`, `lz4`, or `plain` for a game with only loose files.
+`p5z` (zstd volumes read from inside one `.p5z` file,
+[docs/p5z-mode.md](docs/p5z-mode.md)), `pkg`, `lz4`, or `plain` for a game
+with only loose files.
 
 A PKG game runs through [kraken-mount](https://github.com/quer3q/kraken-mount),
 the PKG launcher, which copies `libSceAmpr.sprx` into the game's `fakelib/`

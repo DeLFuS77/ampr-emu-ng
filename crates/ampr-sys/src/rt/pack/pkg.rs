@@ -58,7 +58,7 @@ static DETAIL: AtomicU64 = AtomicU64::new(0);
 // ---- discovery ----
 
 /// Fills `buf` from `off`; false on an error or a short file.
-unsafe fn pread_full(fd: c_int, buf: &mut [u8], off: u64) -> bool {
+pub(super) unsafe fn pread_full(fd: c_int, buf: &mut [u8], off: u64) -> bool {
     // pread_loop continues short reads and retries EINTR, so a signal at
     // module_start does not fail discovery.
     let out = buf.as_mut_ptr();
@@ -76,12 +76,12 @@ unsafe fn pread_full(fd: c_int, buf: &mut [u8], off: u64) -> bool {
 /// Opens read-only through `sys::real_posix_open`: the pre-detour slot, or
 /// before hooks install (module_start) the libkernel `open` symbol, so the
 /// call never enters the runtime's own open hook.
-unsafe fn open_ro(path: *const c_char) -> c_int {
+pub(super) unsafe fn open_ro(path: *const c_char) -> c_int {
     unsafe { sys::real_posix_open(path, O_RDONLY, 0) }
 }
 
 /// Size of open `fd` when it is a regular file.
-unsafe fn regular_size(fd: c_int) -> Option<u64> {
+pub(super) unsafe fn regular_size(fd: c_int) -> Option<u64> {
     let mut st = Stat::default();
     (unsafe { sys::real_physical_fstat(fd, (&raw mut st).cast()) } == 0 && st.is_reg())
         .then_some(st.st_size.max(0) as u64)

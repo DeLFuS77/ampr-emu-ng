@@ -98,7 +98,7 @@ pub(crate) unsafe fn ensure_pipeline_io_scratch(pipeline: &mut ReadPipelineConte
 /// pins the pack fd and sets up the request the worker queues to the pread
 /// pool, or to the reactor when the pool refuses it (worker.rs).
 /// finish_pipeline_window_aio binds the scratch as the window
-/// [range.offset, + range.length).
+/// [range.offset, + range.length), in volume offsets.
 pub(crate) unsafe fn prepare_exact_window_aio(
     range: &PipelineIoRange,
     pipeline: &mut ReadPipelineContext,
@@ -122,7 +122,7 @@ pub(crate) unsafe fn prepare_exact_window_aio(
         pipeline.fd_budget_wait_epoch = ampr_index_fd_open_budget_progress_generation();
         // The payload range comes back from the pin's own PACK_M section:
         // a pinned handle is never closed or reset, so it stays valid.
-        let (fd, payload) = acquire_pack_fd(range.pack_id);
+        let (fd, (payload_begin, payload_end, base)) = acquire_pack_fd(range.pack_id);
         if fd < 0 {
             pipeline.io_range = PipelineIoRange::EMPTY;
             if fd == SCE_KERNEL_ERROR_EAGAIN {
@@ -134,18 +134,29 @@ pub(crate) unsafe fn prepare_exact_window_aio(
         // zstd: [payload_begin, payload_end) is [0, volume size).
         let mut end = 0u64;
         let in_range = checked_add_u64(range.offset, range.length as u64, &mut end)
-            && range.offset >= payload.0
-            && end <= payload.1;
-        if !in_range {
+            && range.offset >= payload_begin
+            && end <= payload_end;
+        // The range and the window stay in volume offsets; only the kernel
+        // read adds the base (p5z: the volume's region start in the .p5z,
+        // else 0). The sum is in range: `end <= payload_end`, the region's
+        // length, and the open checked that the region lies inside the
+        // .p5z (leases.rs `validate_data_header_zstd`). It is still
+        // checked, and must fit off_t, so a broken rule fails the read
+        // with EIO instead of reading elsewhere in the file.
+        let file_offset = range
+            .offset
+            .checked_add(base)
+            .and_then(|o| off_t::try_from(o).ok());
+        let (true, Some(file_offset)) = (in_range, file_offset) else {
             release_pack_fd(range.pack_id);
             pipeline.io_range = PipelineIoRange::EMPTY;
             set_error_out(error_out, SCE_KERNEL_ERROR_EIO);
             return PipelineStep::Failed;
-        }
+        };
 
         pipeline.pack_fd = fd;
         pipeline.native_result = SceKernelAioResult::EMPTY;
-        pipeline.native_request.offset = range.offset as off_t;
+        pipeline.native_request.offset = file_offset;
         pipeline.native_request.nbyte = range.length as usize;
         pipeline.native_request.buf = pipeline.io_scratch as *mut c_void;
         pipeline.native_request.result = &mut pipeline.native_result;

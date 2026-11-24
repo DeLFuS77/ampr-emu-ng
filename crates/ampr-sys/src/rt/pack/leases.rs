@@ -39,6 +39,9 @@ pub(crate) unsafe fn build_pack_path(
     output_size: usize,
 ) -> bool {
     match pack_format() {
+        PackFormat::Zstd if p5z_active() => unsafe {
+            build_pack_path_p5z(state, pack_id, output, output_size)
+        },
         PackFormat::Zstd => unsafe { build_pack_path_zstd(state, pack_id, output, output_size) },
         PackFormat::Pkg => unsafe { build_pack_path_pkg(state, pack_id, output, output_size) },
         PackFormat::Lz4 | PackFormat::Plain => unsafe {
@@ -49,11 +52,12 @@ pub(crate) unsafe fn build_pack_path(
 
 /// Bench helper for the metrics endpoint: when the manifest is mounted (loads
 /// it like a first read would), writes the NUL-terminated absolute path of pack
-/// volume 0 (as acquire_pack_fd opens it; `ampr_zstd-000.pak` in the zstd build)
-/// into `out` and returns (path length without NUL, volume file size from the
-/// manifest pack record or the zstd volume record).
+/// volume 0 (as acquire_pack_fd opens it; `ampr_zstd-000.pak` in the zstd build,
+/// the .p5z in p5z mode) into `out` and returns (path length without NUL,
+/// volume size from the manifest pack record or the zstd volume record, file
+/// offset of the volume's byte 0: its region start in a .p5z, else 0).
 #[cfg(feature = "mem_report")]
-pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u64)> {
+pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u64, u64)> {
     if !unsafe { ensure_manifest_ready() } {
         return None;
     }
@@ -68,7 +72,7 @@ pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u
     } else {
         unsafe { lz4_pack(state, 0) }?.file_size
     };
-    Some((length, file_size))
+    Some((length, file_size, pack_base(0)))
 }
 
 unsafe fn build_pack_path_zstd(
@@ -144,7 +148,9 @@ pub(super) unsafe fn build_pack_path_lz4(
 /// zstd: checks the 64-byte AMPRZDT1 header against the mounted index and
 /// the actual size (`file_size`, from fstat) against `Index::volume_size`.
 /// Chunk offsets are absolute and exact reads stay inside the volume, so the
-/// I/O range is `[0, volume size)`.
+/// I/O range is `[0, volume size)`. p5z: the same in the volume's region of
+/// the .p5z (`file_size` is the .p5z's); the range stays in volume offsets
+/// and `acquire_pack_fd` keeps the region start as the handle's base.
 pub(crate) unsafe fn validate_data_header(
     state: *const PackState,
     pack_id: u16,
@@ -182,13 +188,32 @@ unsafe fn validate_data_header_zstd(
     let Ok(volume_size) = index.volume_size(volume) else {
         return false;
     };
-    if payload_begin.is_null() || payload_end.is_null() || file_size != volume_size {
+    if payload_begin.is_null() || payload_end.is_null() {
         return false;
     }
+    // p5z: the region checked at start-up, checked again against the
+    // mounted index and this fd's size (p5z.rs `p5z_volume_start`).
+    let header_at = if p5z_active() {
+        match p5z_volume_start(volume, file_size, volume_size) {
+            Some(start) => start,
+            None => return false,
+        }
+    } else if file_size == volume_size {
+        0
+    } else {
+        return false;
+    };
     let mut header = [0u8; VOLUME_HEADER_SIZE];
     stats::add(stats::Stat::PackDiskReads, 1);
     stats::add(stats::Stat::PackDiskBytes, VOLUME_HEADER_SIZE as u64);
-    if !unsafe { pread_exact(fd, header.as_mut_ptr() as *mut c_void, header.len(), 0) } {
+    if !unsafe {
+        pread_exact(
+            fd,
+            header.as_mut_ptr() as *mut c_void,
+            header.len(),
+            header_at,
+        )
+    } {
         return false;
     }
     if ampr_format::zstd::volume_header(&header, index, volume).is_err() {
@@ -324,20 +349,25 @@ pub(crate) unsafe fn release_pack_fd_after_read(
 }
 
 /// Pins volume `pack_id`'s fd, opening it when needed, and returns it with
-/// its payload range `[payload_begin, payload_end)` read under the same
-/// PACK_M section as the pin, or an error with an empty range. An fd
-/// already open and not stale is pinned in the first section, one PACK_M
-/// round trip (three per disk read before, with the range check).
-pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
+/// its payload range `[payload_begin, payload_end)` and base (`PackHandle`)
+/// read under the same PACK_M section as the pin, or an error with an empty
+/// range and base 0. An fd already open and not stale is pinned in the
+/// first section, one PACK_M round trip (three per disk read before, with
+/// the range check). After a failed p5z check every volume is EIO, as a
+/// volume whose header fails: no `.pak` file is opened instead.
+pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64, u64)) {
     let state = pack_state();
+    if p5z_failure().is_some() {
+        return (SCE_KERNEL_ERROR_EIO, (0, 0, 0));
+    }
     let (Some(open_fn), Some(_), Some(fstat_fn)) = (real_open(), real_close(), real_fstat()) else {
-        return (SCE_KERNEL_ERROR_EIO, (0, 0));
+        return (SCE_KERNEL_ERROR_EIO, (0, 0, 0));
     };
     let id = pack_id as usize;
     let stale_fd = {
         let _lock = PACK_M.lock();
         if pack_id as u32 >= pack_volume_count(state) {
-            return (SCE_KERNEL_ERROR_EINVAL, (0, 0));
+            return (SCE_KERNEL_ERROR_EINVAL, (0, 0, 0));
         }
         if let Some(pinned) = unsafe { pin_open_pack_fd_locked(state, id) } {
             return pinned;
@@ -347,7 +377,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
             // No new pins on a stale fd; the last unpin bumps
             // PACK_FD_PROGRESS_EPOCH and wakes this job to reopen it.
             if handle.pins != 0 {
-                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0, 0));
             }
             let fd = handle.fd;
             *handle = PackHandle {
@@ -374,21 +404,21 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
         // AMPRPAK4 pack count, or the zstd volume count.
         let pack_count = pack_volume_count(state);
         if pack_id as u32 >= pack_count {
-            return (SCE_KERNEL_ERROR_EINVAL, (0, 0));
+            return (SCE_KERNEL_ERROR_EINVAL, (0, 0, 0));
         }
         // Marked stale since the check above: no new pin, so the last unpin
         // can close it; the next attempt reopens (see above).
         if (*state).pack_handles[id].fd >= 0 && (*state).pack_handles[id].reopen.is_stale() {
-            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0, 0));
         }
         if let Some(pinned) = unsafe { pin_open_pack_fd_locked(state, id) } {
             return pinned;
         }
         if (*state).pack_handles[id].opening {
-            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+            return (SCE_KERNEL_ERROR_EAGAIN, (0, 0, 0));
         }
         if !build_pack_path(state, pack_id, path.as_mut_ptr(), path.len()) {
-            return (SCE_KERNEL_ERROR_ENAMETOOLONG, (0, 0));
+            return (SCE_KERNEL_ERROR_ENAMETOOLONG, (0, 0, 0));
         }
         if (*state).open_pack_count + (*state).opening_pack_count >= AMPR_EMU_PACK_OPEN_PACK_FD_CAP
         {
@@ -402,7 +432,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
                 }
             }
             if victim == INVALID_INDEX {
-                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+                return (SCE_KERNEL_ERROR_EAGAIN, (0, 0, 0));
             }
             let evicted = &mut (*state).pack_handles[victim as usize];
             stats::add(stats::Stat::PackFdEvictions, 1);
@@ -430,7 +460,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
         }
         (*state).pack_handles[id].opening = false;
         (*state).opening_pack_count -= 1;
-        return (SCE_KERNEL_ERROR_EAGAIN, (0, 0));
+        return (SCE_KERNEL_ERROR_EAGAIN, (0, 0, 0));
     }
     let open_start = stats::now();
     let mut fd = open_fn(path.as_ptr(), SCE_KERNEL_O_RDONLY | O_NONBLOCK, 0 as c_int);
@@ -474,6 +504,8 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
     };
     let mut payload_begin = 0u64;
     let mut payload_end = 0u64;
+    // The region validate_data_header checks (fixed since start-up).
+    let base = pack_base(pack_id);
     if fd >= 0
         && (stat_rc != 0
             || stat.st_size < 0
@@ -511,6 +543,7 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
             handle.last_use = tick;
             handle.payload_begin = payload_begin;
             handle.payload_end = payload_end;
+            handle.base = base;
             (*state).open_pack_count += 1;
         }
         // Any finished attempt except a pressure EAGAIN releases `opening`: wake its waiters.
@@ -523,27 +556,34 @@ pub(crate) unsafe fn acquire_pack_fd(pack_id: u16) -> (c_int, (u64, u64)) {
         QUEUE_CV.notify_all();
     }
     if fd >= 0 {
-        (result, (payload_begin, payload_end))
+        (result, (payload_begin, payload_end, base))
     } else {
-        (result, (0, 0))
+        (result, (0, 0, 0))
     }
 }
 
-/// Pins the open, not stale fd of volume `id`: Some((fd, payload range)),
-/// Some(EBUSY) at the pin cap, None when there is no such fd. PACK_M held.
-unsafe fn pin_open_pack_fd_locked(state: *mut PackState, id: usize) -> Option<(c_int, (u64, u64))> {
+/// Pins the open, not stale fd of volume `id`: Some((fd, (payload range,
+/// base))), Some(EBUSY) at the pin cap, None when there is no such fd.
+/// PACK_M held.
+unsafe fn pin_open_pack_fd_locked(
+    state: *mut PackState,
+    id: usize,
+) -> Option<(c_int, (u64, u64, u64))> {
     let tick = (*state).tick;
     let handle = &mut (*state).pack_handles[id];
     if handle.fd < 0 || handle.reopen.is_stale() {
         return None;
     }
     if handle.pins == u32::MAX {
-        return Some((SCE_KERNEL_ERROR_EBUSY, (0, 0)));
+        return Some((SCE_KERNEL_ERROR_EBUSY, (0, 0, 0)));
     }
     handle.pins += 1;
     handle.last_use = tick;
     (*state).tick += 1;
-    Some((handle.fd, (handle.payload_begin, handle.payload_end)))
+    Some((
+        handle.fd,
+        (handle.payload_begin, handle.payload_end, handle.base),
+    ))
 }
 
 #[cfg(test)]

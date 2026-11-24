@@ -407,6 +407,46 @@ pub fn header_counts(h: &[u8]) -> Result<(u64, u64, u32)> {
     Ok((u64_at(h, 40)?, u64_at(h, 48)?, u32_at(h, 20)?))
 }
 
+/// What the p5z start-up check reads from an index header before the mount
+/// (ampr-sys `rt/pack/p5z.rs`): the volume count, the archive id and where
+/// the table of volume sizes starts (8 bytes per volume).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderVolumes {
+    pub count: u32,
+    pub archive_id: [u8; 16],
+    pub volumes_at: u64,
+}
+
+/// Reads `HeaderVolumes` from the first 128 bytes of an index. Checks the
+/// magic, version, header size, header CRC and count only: the payload CRC
+/// and the tables are `Index::open`'s, at the mount.
+pub fn header_volumes(h: &[u8]) -> Result<HeaderVolumes> {
+    let h = h.get(..INDEX_HEADER_SIZE).ok_or(Error::Truncated)?;
+    if &h[..8] != INDEX_MAGIC
+        || u32_at(h, 8)? != FORMAT_VERSION
+        || u32_at(h, 12)? != INDEX_HEADER_SIZE as u32
+    {
+        return Err(Error::Invalid);
+    }
+    let crc_end = INDEX_HEADER_CRC_AT + 4;
+    if crc32_parts(&[&h[..INDEX_PAYLOAD_CRC_AT], &[0; 8], &h[crc_end..]])
+        != u32_at(h, INDEX_HEADER_CRC_AT)?
+    {
+        return Err(Error::Checksum);
+    }
+    let count = u32_at(h, 20)?;
+    if count as usize > MAX_VOLUMES {
+        return Err(Error::Invalid);
+    }
+    let mut archive_id = [0; 16];
+    archive_id.copy_from_slice(&h[24..40]);
+    Ok(HeaderVolumes {
+        count,
+        archive_id,
+        volumes_at: u64_at(h, 72)?,
+    })
+}
+
 /// Parses a 64-byte header, or the first 64 bytes of a complete volume, and
 /// matches it to the checked index and its declared size for volume `id`.
 pub fn volume_header<S: Source + ?Sized>(
@@ -414,12 +454,30 @@ pub fn volume_header<S: Source + ?Sized>(
     index: &Index<'_, S>,
     id: u32,
 ) -> Result<VolumeHeader> {
+    volume_header_for(
+        bytes,
+        id,
+        index.volume_count(),
+        index.archive_id(),
+        index.volume_size(id)?,
+    )
+}
+
+/// `volume_header` against the index's values instead of a mounted index:
+/// volume `id` of `count`, of archive `archive_id`, `volume_size` bytes
+/// with its header. The p5z start-up check runs it before the mount.
+pub fn volume_header_for(
+    bytes: &[u8],
+    id: u32,
+    count: u32,
+    archive_id: &[u8; 16],
+    volume_size: u64,
+) -> Result<VolumeHeader> {
     let header = format::decode_volume_header(bytes).map_err(|_| Error::Invalid)?;
     if header.id != id
-        || header.count != index.volume_count()
-        || header.archive_id != *index.archive_id()
-        || header.payload_bytes.checked_add(VOLUME_HEADER_SIZE as u64)
-            != Some(index.volume_size(id)?)
+        || header.count != count
+        || header.archive_id != *archive_id
+        || header.payload_bytes.checked_add(VOLUME_HEADER_SIZE as u64) != Some(volume_size)
     {
         return Err(Error::Invalid);
     }
@@ -690,5 +748,99 @@ mod tests {
             assert_eq!(index.find(&path), Ok(Some(id)));
         }
         assert_eq!(index.logical_size(n as u64), Err(Error::OutOfRange));
+    }
+
+    /// Recomputes the header CRC (116) of an edited index header, keeping
+    /// its payload CRC (112).
+    fn reseal(h: &mut [u8]) {
+        let payload = u32_at(h, 112).unwrap();
+        h[112..120].fill(0);
+        let crc = crc32(&h[..INDEX_HEADER_SIZE]);
+        h[112..116].copy_from_slice(&payload.to_le_bytes());
+        h[116..120].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn header_volumes_finds_the_volume_table() {
+        let bytes = multi(3);
+        let index = Index::open(&bytes[..]).unwrap();
+        let v = header_volumes(&bytes).unwrap();
+        assert_eq!(v.count, index.volume_count());
+        assert_eq!(&v.archive_id, index.archive_id());
+        let at = v.volumes_at as usize;
+        assert_eq!(
+            u64_at(&bytes, at),
+            Ok(index.volume_size(0).unwrap()),
+            "the table holds the volume sizes"
+        );
+        // A resealed copy of the header passes; only the header is read.
+        let mut h = bytes[..INDEX_HEADER_SIZE].to_vec();
+        reseal(&mut h);
+        assert_eq!(header_volumes(&h), Ok(v));
+
+        assert_eq!(
+            header_volumes(&bytes[..INDEX_HEADER_SIZE - 1]),
+            Err(Error::Truncated)
+        );
+        for (at, value) in [(0usize, b'X'), (8, 2), (12, 64)] {
+            let mut bad = h.clone();
+            bad[at] = value;
+            reseal(&mut bad);
+            assert_eq!(header_volumes(&bad), Err(Error::Invalid), "byte {at}");
+        }
+        let mut bad = h.clone();
+        bad[20..24].copy_from_slice(&(MAX_VOLUMES as u32 + 1).to_le_bytes());
+        reseal(&mut bad);
+        assert_eq!(header_volumes(&bad), Err(Error::Invalid));
+        // An edit without a new CRC: the archive id, the count, the table.
+        for at in [30usize, 20, 72] {
+            let mut bad = h.clone();
+            bad[at] ^= 1;
+            assert_eq!(header_volumes(&bad), Err(Error::Checksum), "byte {at}");
+        }
+    }
+
+    /// A 64-byte AMPRZDT1 header with its CRC.
+    fn volume_bytes(id: u32, count: u32, archive_id: [u8; 16], payload: u64) -> [u8; 64] {
+        let mut h = [0u8; VOLUME_HEADER_SIZE];
+        h[..8].copy_from_slice(b"AMPRZDT1");
+        h[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        h[12..16].copy_from_slice(&(VOLUME_HEADER_SIZE as u32).to_le_bytes());
+        h[16..20].copy_from_slice(&id.to_le_bytes());
+        h[20..24].copy_from_slice(&count.to_le_bytes());
+        h[24..40].copy_from_slice(&archive_id);
+        h[40..48].copy_from_slice(&payload.to_le_bytes());
+        let crc = crc32(&h);
+        h[60..64].copy_from_slice(&crc.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn volume_header_for_makes_the_checks_of_volume_header() {
+        let bytes = multi(3);
+        let index = Index::open(&bytes[..]).unwrap();
+        let size = index.volume_size(0).unwrap();
+        let id = *index.archive_id();
+        let good = volume_bytes(0, 1, id, size - VOLUME_HEADER_SIZE as u64);
+        let header = volume_header(&good, &index, 0).unwrap();
+        assert_eq!(volume_header_for(&good, 0, 1, &id, size), Ok(header));
+        let mut other = id;
+        other[3] ^= 1;
+        for bad in [
+            volume_header_for(&good, 1, 1, &id, size),
+            volume_header_for(&good, 0, 2, &id, size),
+            volume_header_for(&good, 0, 1, &other, size),
+            volume_header_for(&good, 0, 1, &id, size + 1),
+            volume_header_for(&good[..63], 0, 1, &id, size),
+        ] {
+            assert_eq!(bad, Err(Error::Invalid));
+        }
+        let mut flipped = good;
+        flipped[50] ^= 1;
+        assert_eq!(
+            volume_header_for(&flipped, 0, 1, &id, size),
+            Err(Error::Invalid)
+        );
+        assert_eq!(volume_header(&good, &index, 1), Err(Error::OutOfRange));
     }
 }

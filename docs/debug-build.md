@@ -63,9 +63,11 @@ curl http://<ps5-ip>:9090/metrics
 The first line, `build ampr-emu-ng <version> <git rev> debug`, names the PRX
 that answered, so a stale build shows. `ps5/build-docker.sh` sets the git rev
 (`-dirty` when tracked files changed); a build outside it shows `unknown`.
-The second, `pack_format <plain|lz4|zstd|pkg>`, names the title's mode
-(`PackFormat::label` in `rt/pack/mod.rs`), as the load notice does. A pkg
-title shows `pkg`, never `lz4`, though it shares the LZ4 manifest format.
+The second, `pack_format <plain|lz4|zstd|pkg|p5z>`, names the title's mode
+(`mode_label` in `rt/pack/mod.rs`), as the load notice does. A pkg
+title shows `pkg`, never `lz4`, though it shares the LZ4 manifest format,
+and a p5z title `p5z`, never `zstd`, though its format is zstd
+([p5z-mode.md](p5z-mode.md)).
 
 Then one `name value` pair per line: uptime, pool used, peak and size, the
 `rt/stats.rs` counters, the ledgers (`index_mem_*`, `cache_mem_*`,
@@ -206,7 +208,9 @@ stays 0 across a title's play is a candidate for removal.
 
 `/bench` reads pack volume 0 through the unhooked kernel calls, each test in
 its own region so the OS cache does not help later tests. It needs a title
-with packs. It blocks only the metrics thread, but its reads compete with the
+with packs. In a p5z title volume 0 is read from its region of the `.p5z`:
+the `bench path=` line names the `.p5z`, `file_size` is the volume's size
+and `base` its start in the file (0 elsewhere). It blocks only the metrics thread, but its reads compete with the
 game's, so run it while the game is idle.
 
 `/bench?path=/app0/<file>` needs a loose file of at least 736 MiB not read
@@ -326,6 +330,15 @@ written as events happen, so it survives the crash, and holds:
   .pkg size is not pack 0's; detail the .pkg size) or `ok` (detail the
   .pkg size), detail in hex. The path is `/app0/` plus the kraken.image
   line, or `-` before a valid one;
+- one `p5z <how> <volume> <path or -> <rule>` line on how the p5z
+  start-up check ended (`log_p5z_discovery` in `rt/pack/p5z.rs`). `how` is
+  `off` (no maxpack.image), `ok`, `image` (maxpack.image refused; `rule`
+  says which rule), `index` (ampr_zstd.index unreadable or its header
+  refused), `open` (the .p5z did not open or is not a regular file),
+  `header` (`rule` says which), `archiveid`, `region` or `volume` (the
+  volume id in hex). The path is the `/app0/` path maxpack.image names,
+  or `-` before it parses ([p5z-mode.md](p5z-mode.md));
+- one `mode <label>` line, the mode the load notice names;
 - one `rw on` or `rw off errno=<hex>` line, the writable /app0 test
   (`init` in `rt/rw.rs`): the errno of `access("/app0", W_OK)`
   ([writable-app0.md](writable-app0.md));

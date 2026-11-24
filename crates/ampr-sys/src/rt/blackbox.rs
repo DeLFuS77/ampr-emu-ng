@@ -135,6 +135,29 @@ pub(crate) fn pkg(how: &[u8], detail: u64, path: &[u8]) {
     l.s(if path.is_empty() { b"-" } else { path }).emit();
 }
 
+/// The p5z start-up check (rt/pack/p5z.rs `log_p5z_discovery`):
+/// "p5z <how> <volume> <path or -> <rule>", the rule of a refused
+/// maxpack.image or .p5z header (empty otherwise).
+pub(crate) fn p5z(how: &[u8], volume: u64, path: &[u8], rule: &[u8]) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    let path = path.strip_suffix(&[0]).unwrap_or(path);
+    let mut l = Line::new();
+    l.s(b"p5z ").s(how).s(b" ").x(volume).s(b" ");
+    l.s(if path.is_empty() { b"-" } else { path });
+    l.s(b" ").s(rule).emit();
+}
+
+/// The mode the load notice names (rt/pack/mod.rs `mode_label`):
+/// "mode <label>".
+pub(crate) fn mode(label: &[u8]) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    Line::new().s(b"mode ").s(label).emit();
+}
+
 /// One index load (rt/index.rs `ensure_ready_slow`): "idx <how> files=<n>",
 /// `how` the LoadResult or `walk memory`/`walk installed` for a walk build.
 pub(crate) fn idx(how: &[u8], files: u64) {

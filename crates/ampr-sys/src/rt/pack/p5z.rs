@@ -555,13 +555,17 @@ mod tests {
         assert_eq!(refused(|d| d.bytes(INDEX_PATH).truncate(100)), P5zFail::Index);
         // Header CRC: an edit without a new CRC.
         assert_eq!(refused(|d| d.bytes(INDEX_PATH)[30] ^= 1), P5zFail::Index);
-        // A volume table past the end of the file (and of u64).
+        // A volume table offset the header's own layout refuses (resealed).
         let far = |d: &mut Mem| {
             let ix = d.bytes(INDEX_PATH);
             ix[72..80].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
             reseal_index(ix);
         };
         assert_eq!(refused(far), P5zFail::Index);
+        // A good header in a file cut before its volume table: the read of
+        // the table fails.
+        let at = u64::from_le_bytes(INDEX[72..80].try_into().unwrap()) as usize;
+        assert_eq!(refused(|d| d.bytes(INDEX_PATH).truncate(at)), P5zFail::Index);
     }
 
     #[test]

@@ -85,9 +85,12 @@ order, and stops at the first failure:
 
 1. `maxpack.image` is a regular file of at most 12 KiB and parses (above).
    The path, with `/app0/` in front, must fit 265 bytes.
-2. The header of `ampr_zstd.index` (its first 128 bytes): magic `AMPRZPK1`,
-   version 1, header size 128 and the header CRC (`header_volumes`). Its
-   volume count must be the number of volume lines in `maxpack.image`.
+2. The header of `ampr_zstd.index` (its first 128 bytes), with every check
+   of the mount that needs only those bytes, the same code
+   (`header_volumes`): magic `AMPRZPK1`, version 1, header size 128, chunk
+   shift, zstd level, reserved fields, the header CRC, the counts and the
+   table layout. Its volume count must be the number of volume lines in
+   `maxpack.image`.
 3. The `.p5z` opens and is a regular file; its first 64 bytes are a header:
    magic `MAXPKP5Z`, version 1, header size 64, CRC-32 (IEEE) at bytes
    60..64 over the 64 bytes with that field taken as zero.
@@ -102,8 +105,8 @@ order, and stops at the first failure:
    size match the index), here against the values read in 2 and 5
    (`volume_header_for`).
 
-The rest of `ampr_zstd.index` (its payload CRC and every record) is
-checked when it is mounted, right after, still in module_start, as for any
+The rest of `ampr_zstd.index` (its payload CRC, that its strings end the
+file, and every record) is checked when it is mounted, right after, still in module_start, as for any
 zstd title: if that fails no packed file is served, as in zstd mode, and
 the notice already sent is the usual one. Each volume's first open checks
 its region and header again, against the mounted index and the size of

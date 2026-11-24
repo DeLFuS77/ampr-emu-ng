@@ -56,70 +56,123 @@ pub struct Index<'s, S: Source + ?Sized = [u8]> {
     total_logical_bytes: u64,
 }
 
-impl<'s, S: Source + ?Sized> Index<'s, S> {
-    pub fn open(src: &'s S) -> Result<Self> {
-        let mut h = [0u8; INDEX_HEADER_SIZE];
-        src.read_at(0, &mut h)?;
+/// The 128-byte index header. Its checks are the ones that need no other
+/// byte of the index, so `Index::open` (the mount) and `header_volumes`
+/// (the p5z start-up check) refuse the same headers.
+struct Header {
+    volume_count: u32,
+    file_count: u64,
+    chunk_count: u64,
+    files_off: u64,
+    chunks_off: u64,
+    volumes_off: u64,
+    strings_off: u64,
+    strings_len: u64,
+    archive_id: [u8; 16],
+    total_logical_bytes: u64,
+}
+
+impl Header {
+    /// The checks `Index::open` makes before the payload CRC: magic,
+    /// version, header size, chunk shift, zstd level and reserved fields
+    /// (Invalid), then the header CRC (Checksum).
+    fn read(h: &[u8; INDEX_HEADER_SIZE]) -> Result<Self> {
         if &h[..8] != INDEX_MAGIC
-            || u32_at(&h, 8)? != FORMAT_VERSION
-            || u32_at(&h, 12)? != INDEX_HEADER_SIZE as u32
+            || u32_at(h, 8)? != FORMAT_VERSION
+            || u32_at(h, 12)? != INDEX_HEADER_SIZE as u32
             || h[16] != CHUNK_SHIFT
             || !ZSTD_LEVELS.contains(&h[17])
-            || u16_at(&h, 18)? != 0
-            || u64_at(&h, 104)? != 0
-            || u64_at(&h, 120)? != 0
+            || u16_at(h, 18)? != 0
+            || u64_at(h, 104)? != 0
+            || u64_at(h, 120)? != 0
         {
             return Err(Error::Invalid);
         }
         let crc_end = INDEX_HEADER_CRC_AT + 4;
         if crc32_parts(&[&h[..INDEX_PAYLOAD_CRC_AT], &[0; 8], &h[crc_end..]])
-            != u32_at(&h, INDEX_HEADER_CRC_AT)?
-            || src_crc32(src, INDEX_HEADER_SIZE as u64, src.len(), 0)?
-                != u32_at(&h, INDEX_PAYLOAD_CRC_AT)?
+            != u32_at(h, INDEX_HEADER_CRC_AT)?
         {
             return Err(Error::Checksum);
         }
-        let volume_count = u32_at(&h, 20)?;
-        let file_count = u64_at(&h, 40)?;
-        let chunk_count = u64_at(&h, 48)?;
-        if volume_count as usize > MAX_VOLUMES || chunk_count > u32::MAX as u64 {
+        let mut archive_id = [0; 16];
+        archive_id.copy_from_slice(&h[24..40]);
+        Ok(Self {
+            volume_count: u32_at(h, 20)?,
+            file_count: u64_at(h, 40)?,
+            chunk_count: u64_at(h, 48)?,
+            files_off: u64_at(h, 56)?,
+            chunks_off: u64_at(h, 64)?,
+            volumes_off: u64_at(h, 72)?,
+            strings_off: u64_at(h, 80)?,
+            strings_len: u64_at(h, 88)?,
+            archive_id,
+            total_logical_bytes: u64_at(h, 96)?,
+        })
+    }
+
+    /// The checks `Index::open` makes after the payload CRC: the counts and
+    /// the table layout (Invalid). `file_len` is the index's length; None
+    /// (the header alone) skips the one rule that needs it, that the
+    /// strings end the file.
+    fn check(&self, file_len: Option<u64>) -> Result<()> {
+        if self.volume_count as usize > MAX_VOLUMES || self.chunk_count > u32::MAX as u64 {
             return Err(Error::Invalid);
         }
-        let files_off = u64_at(&h, 56)?;
-        let chunks_off = u64_at(&h, 64)?;
-        let volumes_off = u64_at(&h, 72)?;
-        let strings_off = u64_at(&h, 80)?;
-        let strings_len = u64_at(&h, 88)?;
-        if files_off != INDEX_HEADER_SIZE as u64
-            || files_off.checked_add(
-                file_count
+        let strings_end = match (self.strings_off.checked_add(self.strings_len), file_len) {
+            (None, _) => false,
+            (Some(end), Some(len)) => end == len,
+            (Some(_), None) => true,
+        };
+        // chunk_count fits u32 (above), so `* CHUNK_RECORD_SIZE` cannot wrap.
+        if self.files_off != INDEX_HEADER_SIZE as u64
+            || self.files_off.checked_add(
+                self.file_count
                     .checked_mul(FILE_RECORD_SIZE as u64)
                     .ok_or(Error::Invalid)?,
-            ) != Some(chunks_off)
-            || chunks_off.checked_add(chunk_count * CHUNK_RECORD_SIZE as u64) != Some(volumes_off)
-            || volumes_off.checked_add(u64::from(volume_count) * VOLUME_RECORD_SIZE as u64)
-                != Some(strings_off)
-            || strings_off.checked_add(strings_len) != Some(src.len())
-            || strings_len > u32::MAX as u64
-            || (chunk_count == 0) != (volume_count == 0)
+            ) != Some(self.chunks_off)
+            || self
+                .chunks_off
+                .checked_add(self.chunk_count * CHUNK_RECORD_SIZE as u64)
+                != Some(self.volumes_off)
+            || self
+                .volumes_off
+                .checked_add(u64::from(self.volume_count) * VOLUME_RECORD_SIZE as u64)
+                != Some(self.strings_off)
+            || !strings_end
+            || self.strings_len > u32::MAX as u64
+            || (self.chunk_count == 0) != (self.volume_count == 0)
         {
             return Err(Error::Invalid);
         }
-        let mut archive_id = [0; 16];
-        archive_id.copy_from_slice(&h[24..40]);
+        Ok(())
+    }
+}
+
+impl<'s, S: Source + ?Sized> Index<'s, S> {
+    pub fn open(src: &'s S) -> Result<Self> {
+        let mut h = [0u8; INDEX_HEADER_SIZE];
+        src.read_at(0, &mut h)?;
+        let header = Header::read(&h)?;
+        if src_crc32(src, INDEX_HEADER_SIZE as u64, src.len(), 0)?
+            != u32_at(&h, INDEX_PAYLOAD_CRC_AT)?
+        {
+            return Err(Error::Checksum);
+        }
+        header.check(Some(src.len()))?;
         let index = Self {
             src,
             tables: None,
-            files_at: files_off,
-            file_count,
-            chunks_at: chunks_off,
-            chunk_count: chunk_count as u32,
-            volumes_at: volumes_off,
-            volume_count,
-            strings_at: strings_off,
-            strings_len,
-            archive_id,
-            total_logical_bytes: u64_at(&h, 96)?,
+            files_at: header.files_off,
+            file_count: header.file_count,
+            chunks_at: header.chunks_off,
+            // `check` bounds it by u32::MAX.
+            chunk_count: header.chunk_count as u32,
+            volumes_at: header.volumes_off,
+            volume_count: header.volume_count,
+            strings_at: header.strings_off,
+            strings_len: header.strings_len,
+            archive_id: header.archive_id,
+            total_logical_bytes: header.total_logical_bytes,
         };
         index.validate()?;
         Ok(index)
@@ -417,33 +470,21 @@ pub struct HeaderVolumes {
     pub volumes_at: u64,
 }
 
-/// Reads `HeaderVolumes` from the first 128 bytes of an index. Checks the
-/// magic, version, header size, header CRC and count only: the payload CRC
-/// and the tables are `Index::open`'s, at the mount.
+/// Reads `HeaderVolumes` from the first 128 bytes of an index, with every
+/// check of `Index::open` that needs only those bytes (`Header`), so the
+/// start-up check refuses every header the mount refuses. The payload CRC,
+/// the end of the file and the records are `Index::open`'s, at the mount.
 pub fn header_volumes(h: &[u8]) -> Result<HeaderVolumes> {
-    let h = h.get(..INDEX_HEADER_SIZE).ok_or(Error::Truncated)?;
-    if &h[..8] != INDEX_MAGIC
-        || u32_at(h, 8)? != FORMAT_VERSION
-        || u32_at(h, 12)? != INDEX_HEADER_SIZE as u32
-    {
-        return Err(Error::Invalid);
-    }
-    let crc_end = INDEX_HEADER_CRC_AT + 4;
-    if crc32_parts(&[&h[..INDEX_PAYLOAD_CRC_AT], &[0; 8], &h[crc_end..]])
-        != u32_at(h, INDEX_HEADER_CRC_AT)?
-    {
-        return Err(Error::Checksum);
-    }
-    let count = u32_at(h, 20)?;
-    if count as usize > MAX_VOLUMES {
-        return Err(Error::Invalid);
-    }
-    let mut archive_id = [0; 16];
-    archive_id.copy_from_slice(&h[24..40]);
+    let h: &[u8; INDEX_HEADER_SIZE] = h
+        .get(..INDEX_HEADER_SIZE)
+        .and_then(|h| h.try_into().ok())
+        .ok_or(Error::Truncated)?;
+    let header = Header::read(h)?;
+    header.check(None)?;
     Ok(HeaderVolumes {
-        count,
-        archive_id,
-        volumes_at: u64_at(h, 72)?,
+        count: header.volume_count,
+        archive_id: header.archive_id,
+        volumes_at: header.volumes_off,
     })
 }
 
@@ -798,6 +839,46 @@ mod tests {
             bad[at] ^= 1;
             assert_eq!(header_volumes(&bad), Err(Error::Checksum), "byte {at}");
         }
+    }
+
+    /// Every header the mount refuses on its 128 bytes alone is refused at
+    /// start-up too, with the same error: each edit is resealed, so only
+    /// its own rule fails, and the payload CRC still matches.
+    #[test]
+    fn header_volumes_refuses_what_index_open_refuses_in_the_header() {
+        type Edit = fn(&mut [u8]);
+        let edits: [(&str, Edit); 10] = [
+            ("chunk shift 16", |h| h[16] = 16),
+            ("zstd level 0", |h| h[17] = 0),
+            ("zstd level 23", |h| h[17] = 23),
+            ("reserved u16 at 18", |h| h[18] = 1),
+            ("reserved u64 at 104", |h| h[104] = 1),
+            ("reserved u64 at 120", |h| h[120] = 1),
+            ("chunk count over u32::MAX", |h| {
+                h[48..56].copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes())
+            }),
+            ("files not right after the header", |h| {
+                h[56..64].copy_from_slice(&129u64.to_le_bytes())
+            }),
+            ("chunk table not before the volume table", |h| {
+                h[72..80].copy_from_slice(&1u64.to_le_bytes())
+            }),
+            ("chunks with no volume", |h| h[20..24].fill(0)),
+        ];
+        let mut passed = Vec::new();
+        for (what, edit) in edits {
+            let mut bytes = multi(3);
+            edit(&mut bytes[..INDEX_HEADER_SIZE]);
+            reseal(&mut bytes[..INDEX_HEADER_SIZE]);
+            let mount = Index::open(&bytes[..]).err();
+            assert_eq!(mount, Some(Error::Invalid), "{what}: the mount refuses it");
+            for h in [&bytes[..], &bytes[..INDEX_HEADER_SIZE]] {
+                if header_volumes(h).err() != mount {
+                    passed.push((what, h.len()));
+                }
+            }
+        }
+        assert!(passed.is_empty(), "start-up passed: {passed:?}");
     }
 
     /// A 64-byte AMPRZDT1 header with its CRC.

@@ -608,6 +608,176 @@ mod tests {
         assert_eq!(refused(crc), P5zFail::Check(Volume(0)));
     }
 
+    /// The name MaxPack's PC app gives a `.p5z` ("<Title> [<TITLE_ID>].p5z")
+    /// keeps the title's ™, ’ and accents: the check opens it as it is.
+    const UTF8_GAME: &CStr = c"/app0/p5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z";
+
+    #[test]
+    fn p5z_check_passes_a_utf8_name() {
+        let mut disk = Mem::game();
+        let text = format!(
+            "maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 {START} {LEN}\n"
+        );
+        *disk.bytes(P5Z_IMAGE) = text.into_bytes();
+        disk.file(GAME).0 = UTF8_GAME;
+        let (result, table) = run(&mut disk);
+        assert_eq!(result, Ok(()));
+        let n = table.path.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&table.path[..=n], UTF8_GAME.to_bytes_with_nul());
+        // The same name with a control byte, or not UTF-8, is refused.
+        for name in [&b"a\x01b.p5z"[..], b"a\xffb.p5z", b"a\\b.p5z"] {
+            let mut text = b"maxpack-image 1\np5z/".to_vec();
+            text.extend_from_slice(name);
+            text.extend_from_slice(format!("\n0 {START} {LEN}\n").as_bytes());
+            let fail = refused(|d| *d.bytes(P5Z_IMAGE) = text);
+            assert!(
+                matches!(fail, P5zFail::Check(P5zError::Image(_))),
+                "{name:?}: {fail:?}"
+            );
+        }
+    }
+
+    // The seven-volume game of
+    // crates/ampr-format/tests/fixtures/p5z-multi/README.md: every volume
+    // but the first starts past volume 0, as in any game over about 4 GiB
+    // of packed data.
+    const M_P5Z: &[u8] =
+        include_bytes!("../../../../ampr-format/tests/fixtures/p5z-multi/multi.p5z");
+    const M_INDEX: &[u8] =
+        include_bytes!("../../../../ampr-format/tests/fixtures/p5z-multi/ampr_zstd.index");
+    const M_IMAGE: &[u8] =
+        include_bytes!("../../../../ampr-format/tests/fixtures/p5z-multi/maxpack.image");
+    const M_GAME: &CStr = c"/app0/p5z/multi.p5z";
+    /// (start, length) of each volume, from `info --play`.
+    const M_REGIONS: [(u64, u64); 7] = [
+        (10_149, 264_799),
+        (274_948, 262_208),
+        (537_156, 265_802),
+        (802_958, 262_208),
+        (1_065_166, 442_557),
+        (1_507_723, 286_971),
+        (1_794_694, 282_848),
+    ];
+
+    impl Mem {
+        fn multi() -> Self {
+            Self {
+                files: std::vec![
+                    (P5Z_IMAGE, M_IMAGE.to_vec(), true),
+                    (zstd::AMPR_EMU_ZSTD_INDEX_PATH, M_INDEX.to_vec(), true),
+                    (M_GAME, M_P5Z.to_vec(), true),
+                ],
+                open: Vec::new(),
+            }
+        }
+    }
+
+    fn m_image(regions: &[(u64, u64)]) -> Vec<u8> {
+        let mut s = std::string::String::from("maxpack-image 1\np5z/multi.p5z\n");
+        for (k, (start, len)) in regions.iter().enumerate() {
+            s.push_str(&format!("{k} {start} {len}\n"));
+        }
+        s.into_bytes()
+    }
+
+    /// The check's error on the seven-volume game after `edit`.
+    fn refused_multi(edit: impl FnOnce(&mut Mem)) -> P5zFail {
+        let mut disk = Mem::multi();
+        edit(&mut disk);
+        run(&mut disk).0.expect_err("the check passed")
+    }
+
+    #[test]
+    fn p5z_check_passes_the_multi_volume_game() {
+        assert_eq!(M_IMAGE, &m_image(&M_REGIONS)[..]);
+        let mut disk = Mem::multi();
+        let (result, table) = run(&mut disk);
+        assert_eq!(result, Ok(()));
+        assert_eq!(table.count, M_REGIONS.len());
+        for (k, &(start, len)) in M_REGIONS.iter().enumerate() {
+            assert_eq!(table.regions[k], Region { start, len }, "volume {k}");
+        }
+        let n = table.path.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&table.path[..=n], M_GAME.to_bytes_with_nul());
+        assert_eq!(M_P5Z.len() as u64, 2_095_040);
+    }
+
+    /// Broken copies of the seven-volume game where only volume k >= 1 is
+    /// wrong: the check reads volume k's size at `volumes_at + 8k` and
+    /// names volume k.
+    #[test]
+    fn p5z_check_refuses_a_bad_later_volume() {
+        use P5zError::*;
+        let volumes_at = u64::from_le_bytes(M_INDEX[72..80].try_into().unwrap()) as usize;
+        for k in 1..M_REGIONS.len() {
+            let id = k as u32;
+            let (start, len) = M_REGIONS[k];
+            let with = |start: u64, len: u64| {
+                let mut r = M_REGIONS;
+                r[k] = (start, len);
+                m_image(&r)
+            };
+            let image = |text: Vec<u8>| refused_multi(move |d| *d.bytes(P5Z_IMAGE) = text);
+            assert_eq!(image(with(start, len - 1)), P5zFail::Check(Region(id)), "{k}");
+            assert_eq!(image(with(start, len + 1)), P5zFail::Check(Region(id)), "{k}");
+            // In the file, but one byte late: no volume header there.
+            assert_eq!(image(with(start + 1, len)), P5zFail::Check(Volume(id)), "{k}");
+            // Volume 0's region in place of volume k's.
+            let (start0, len0) = M_REGIONS[0];
+            let want = if len0 == len { Volume(id) } else { Region(id) };
+            assert_eq!(image(with(start0, len0)), P5zFail::Check(want), "{k}");
+
+            // Volume k's header in the .p5z: another archive (resealed), or
+            // its CRC.
+            let at = start as usize;
+            let other_archive = move |d: &mut Mem| {
+                let p = d.bytes(M_GAME);
+                p[at + 30] ^= 0xff;
+                reseal(p, at, 64, 60);
+            };
+            assert_eq!(refused_multi(other_archive), P5zFail::Check(Volume(id)), "{k}");
+            let crc = move |d: &mut Mem| d.bytes(M_GAME)[at + 50] ^= 1;
+            assert_eq!(refused_multi(crc), P5zFail::Check(Volume(id)), "{k}");
+
+            // Volume k's size in the index's volume table (the start-up
+            // check does not read the payload CRC that covers it).
+            let record = volumes_at + 8 * k;
+            let bigger = move |d: &mut Mem| {
+                let ix = d.bytes(INDEX_PATH);
+                let size = u64::from_le_bytes(ix[record..record + 8].try_into().unwrap());
+                ix[record..record + 8].copy_from_slice(&(size + 1).to_le_bytes());
+            };
+            assert_eq!(refused_multi(bigger), P5zFail::Check(Region(id)), "{k}");
+            // An index cut inside volume k's size.
+            let cut = move |d: &mut Mem| d.bytes(INDEX_PATH).truncate(record + 4);
+            assert_eq!(refused_multi(cut), P5zFail::Index, "{k}");
+        }
+
+        // Volumes 1 and 3 have the same size: swapped, both regions fit and
+        // the header at volume 1's start is volume 3's.
+        assert_eq!(M_REGIONS[1].1, M_REGIONS[3].1);
+        let mut swapped = M_REGIONS;
+        swapped.swap(1, 3);
+        let text = m_image(&swapped);
+        assert_eq!(
+            refused_multi(move |d| *d.bytes(P5Z_IMAGE) = text),
+            P5zFail::Check(Volume(1))
+        );
+        // Cut so the footer would overlap the last region by one byte.
+        let (start6, len6) = M_REGIONS[6];
+        let size = (start6 + len6 + 31) as usize;
+        assert_eq!(
+            refused_multi(move |d| d.bytes(M_GAME).truncate(size)),
+            P5zFail::Check(Region(6))
+        );
+        // One volume line fewer than the index has.
+        let text = m_image(&M_REGIONS[..6]);
+        assert!(matches!(
+            refused_multi(move |d| *d.bytes(P5Z_IMAGE) = text),
+            P5zFail::Check(Image(_))
+        ));
+    }
+
     /// Every failure text fits the notice line (exports.rs `NOTICE_MAX`).
     #[test]
     fn p5z_reasons_are_short_ascii() {

@@ -12,9 +12,12 @@ The pure logic (parsing, header and region checks, offsets) is
 `crates/ampr-format/src/p5z.rs`, plus `header_volumes` and
 `volume_header_for` in `crates/ampr-format/src/zstd.rs` for the index
 header and the volume headers before the index is mounted. It allocates
-nothing. Tests: `crates/ampr-format/tests/p5z_fixture.rs`, with a real
-`.p5z` in `crates/ampr-format/tests/fixtures/p5z/`. The runtime side (the
-start-up check, the region table, the reads) is
+nothing. Tests: `crates/ampr-format/tests/p5z_fixture.rs`, with real
+`.p5z` files made by the MaxPack engine: one volume in
+`crates/ampr-format/tests/fixtures/p5z/` and seven volumes in
+`crates/ampr-format/tests/fixtures/p5z-multi/` (as in any game over about
+4 GiB of packed data, every volume but the first starts past volume 0).
+The runtime side (the start-up check, the region table, the reads) is
 `crates/ampr-sys/src/rt/pack/p5z.rs`, whose tests run the check on the
 same fixture files and on broken copies of them.
 
@@ -29,12 +32,18 @@ folder of its own as any other folder.
 ## `maxpack.image`
 
 `/app0/maxpack.image` tells where the regions are. The payload that mounts
-the game writes it; ampr-emu-ng reads it. It is ASCII text, lines end with
-`\n` (never `\r`), at most 12 KiB:
+the game writes it; ampr-emu-ng reads it. It is UTF-8 text, lines end with
+`\n` (never `\r`), with no other control byte (below 0x20, or 0x7F), at
+most 12 KiB:
 
 1. `maxpack-image 1`
-2. The path of the `.p5z`, relative to `/app0`: `p5z/<file name>`. No
-   leading `/`, no `\`, and no empty, `.` or `..` component.
+2. The path of the `.p5z`, relative to `/app0`: `p5z/<name>`, where
+   `<name>` is the file name of the `.p5z`: valid UTF-8, not empty, not
+   `.` or `..`, with no byte below 0x20, no 0x7F, no `/` and no `\`. The
+   name is the bytes the payload read from the directory, and the PS5 opens
+   `/app0/p5z/<name>` with those same bytes, so any name the console's
+   filesystem gives in UTF-8 round-trips (MaxPack's PC app names a `.p5z`
+   `<Title> [<TITLE_ID>].p5z` and keeps every character of the title).
 3. One line per volume, `<id> <start> <length>`: three decimal numbers
    separated by one space. `start` is the byte offset of the volume in the
    `.p5z`; `length` is its size in bytes, header included. The ids go 0 to
@@ -49,11 +58,15 @@ p5z/basic.p5z
 0 1234 5678
 ```
 
-that is `"maxpack-image 1\np5z/basic.p5z\n0 1234 5678\n"`. Anything else is
-refused: another first line, a missing or unsafe path, ids that do not
-start at 0 or skip or repeat or come out of order, no volumes or more than
-256, numbers with a sign, letters or more than 64 bits, `\r`, an extra
-line, or a file over 12 KiB.
+that is `"maxpack-image 1\np5z/basic.p5z\n0 1234 5678\n"`. A second test on
+each side checks a UTF-8 name, the payload writing and ampr-emu-ng reading
+exactly
+`"maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 1234 5678\n"`.
+Anything else is refused: text that is not UTF-8, another first line, a
+missing path, a path that is not `p5z/` and one name as above, ids that do
+not start at 0 or skip or repeat or come out of order, no volumes or more
+than 256, numbers with a sign, letters or more than 64 bits, `\r` or any
+other control byte, an extra line, or a file over 12 KiB.
 
 Offsets are `u64`: the `.p5z` of a large game is well over 4 GiB, and every
 sum of offsets is checked, never wrapping.

@@ -4,13 +4,16 @@
 //! This module parses `maxpack.image` (which tells where the regions are),
 //! checks the 64-byte `.p5z` header and checks every region against the
 //! volume sizes of `ampr_zstd.index`. It reserves no memory.
-use crate::{crc32_parts, safe_components, u32_at};
+use crate::{crc32_parts, u32_at};
 
 pub const IMAGE_NAME: &str = "maxpack.image";
 pub const MAX_VOLUMES: usize = 256;
 pub const IMAGE_MAX_BYTES: usize = 12 * 1024;
 
 const IMAGE_MAGIC: &[u8] = b"maxpack-image 1";
+/// Line 2 is `p5z/<name>`: the payload mounts the folder that holds the
+/// `.p5z` at `/app0/p5z/`.
+const MOUNT_PREFIX: &[u8] = b"p5z/";
 const HEADER_SIZE: usize = 64;
 const FOOTER_SIZE: u64 = 32;
 
@@ -63,10 +66,28 @@ fn decimal(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-/// Reads `maxpack.image`: returns the `.p5z` path (relative to `/app0`) and
-/// the number of volumes, whose regions are written to `out[..n]`.
+/// A control byte of the contract: below 0x20 or 0x7F. `\n` ends lines.
+fn control(b: u8) -> bool {
+    b < 0x20 || b == 0x7f
+}
+
+/// The `.p5z` file name line 2 carries after `p5z/`: valid UTF-8 (the bytes
+/// the kernel's readdir gave the payload, which go back to `open` as they
+/// are), not empty, not `.` or `..`, no control byte, no `/` and no `\`.
+pub fn image_name_ok(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name != b"."
+        && name != b".."
+        && !name.iter().any(|&b| control(b) || b == b'/' || b == b'\\')
+        && core::str::from_utf8(name).is_ok()
+}
+
+/// Reads `maxpack.image`: returns the `.p5z` path (relative to `/app0`,
+/// always `p5z/<name>`) and the number of volumes, whose regions are written
+/// to `out[..n]`.
 ///
-/// The text is ASCII with `\n` line ends; the final `\n` is optional.
+/// The text is UTF-8 with `\n` line ends and no other control byte; the
+/// final `\n` is optional.
 pub fn parse_image<'a>(
     text: &'a [u8],
     out: &mut [Region; MAX_VOLUMES],
@@ -74,8 +95,11 @@ pub fn parse_image<'a>(
     if text.len() > IMAGE_MAX_BYTES {
         return Err(P5zError::Image("too long"));
     }
-    if text.iter().any(|&b| b == b'\r' || b == 0 || b >= 0x80) {
-        return Err(P5zError::Image("not plain ASCII with LF ends"));
+    if core::str::from_utf8(text).is_err() {
+        return Err(P5zError::Image("not UTF-8"));
+    }
+    if text.iter().any(|&b| b != b'\n' && control(b)) {
+        return Err(P5zError::Image("control byte (only LF ends lines)"));
     }
     let body = text.strip_suffix(b"\n").unwrap_or(text);
     let mut lines = body.split(|&b| b == b'\n');
@@ -83,8 +107,9 @@ pub fn parse_image<'a>(
         return Err(P5zError::Image("first line"));
     }
     let path = lines.next().ok_or(P5zError::Image("no path"))?;
-    if path.first() == Some(&b'/') || !safe_components(path) {
-        return Err(P5zError::Image("path"));
+    match path.strip_prefix(MOUNT_PREFIX) {
+        Some(name) if image_name_ok(name) => {}
+        _ => return Err(P5zError::Image("path")),
     }
     let mut n = 0;
     for line in lines {
@@ -200,6 +225,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!((n, out[2]), (3, Region { start: 94, len: 30 }));
+    }
+
+    /// The shared golden case of the contract: the payload's `image_text`
+    /// test writes this exact text. A UTF-8 name as MaxPack's PC app names
+    /// a `.p5z` ("<Title> [<TITLE_ID>].p5z").
+    const GOLDEN_UTF8: &str =
+        "maxpack-image 1\np5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z\n0 1234 5678\n";
+
+    #[test]
+    fn image_golden_utf8_parses() {
+        let (path, n, r) = parse(GOLDEN_UTF8.as_bytes()).unwrap();
+        assert_eq!(
+            path,
+            "p5z/Marvel’s Spider-Man™ 2 [PPSA01234].p5z".as_bytes()
+        );
+        assert_eq!(
+            (n, r),
+            (
+                1,
+                Region {
+                    start: 1234,
+                    len: 5678
+                }
+            )
+        );
+        for name in [
+            "God of War Ragnarök [PPSA01411].p5z",
+            "グランツーリスモ７ [PPSA01316].p5z",
+            "Gran Turismo® 7.p5z",
+            "a b.p5z",
+            "~!@#$%^&()_+=-{}[];',.p5z",
+            "x",
+            "...",
+            "a.p5z ",
+            " a.p5z",
+        ] {
+            let text = std::format!("maxpack-image 1\np5z/{name}\n0 64 1\n");
+            let (path, _, _) = parse(text.as_bytes()).unwrap();
+            assert_eq!(path, std::format!("p5z/{name}").as_bytes(), "{name}");
+        }
+    }
+
+    #[test]
+    fn image_refuses_bad_names() {
+        let cases: [(&str, &[u8]); 27] = [
+            ("invalid UTF-8 byte", b"p5z/a\xff.p5z"),
+            ("lone continuation byte", b"p5z/a\x80.p5z"),
+            ("overlong slash", b"p5z/a\xc0\xaf.p5z"),
+            ("cut sequence", b"p5z/a\xe2\x84.p5z"),
+            ("cut sequence at the end", b"p5z/a\xe2\x84"),
+            ("surrogate", b"p5z/a\xed\xa0\x80.p5z"),
+            ("NUL", b"p5z/a\0.p5z"),
+            ("0x01", b"p5z/a\x01.p5z"),
+            ("0x1f", b"p5z/a\x1f.p5z"),
+            ("tab", b"p5z/a\tb.p5z"),
+            ("CR alone", b"p5z/a\rb.p5z"),
+            ("CR at the end", b"p5z/a.p5z\r"),
+            ("DEL", b"p5z/a\x7f.p5z"),
+            ("backslash", b"p5z/a\\b.p5z"),
+            ("empty name", b"p5z/"),
+            ("dot", b"p5z/."),
+            ("dotdot", b"p5z/.."),
+            ("no p5z/", b"a.p5z"),
+            ("other folder", b"other/a.p5z"),
+            ("P5Z/ in capitals", b"P5Z/a.p5z"),
+            ("p5z without slash", b"p5z"),
+            ("nested", b"p5z/sub/a.p5z"),
+            ("double slash", b"p5z//a.p5z"),
+            ("dot folder first", b"./p5z/a.p5z"),
+            ("absolute", b"/app0/p5z/a.p5z"),
+            ("trailing slash", b"p5z/a.p5z/"),
+            ("dotdot after", b"p5z/../a.p5z"),
+        ];
+        for (what, name) in cases {
+            let mut text = b"maxpack-image 1\n".to_vec();
+            text.extend_from_slice(name);
+            text.extend_from_slice(b"\n0 64 1\n");
+            assert!(
+                matches!(parse(&text), Err(P5zError::Image(_))),
+                "{what}: {:?}",
+                parse(&text)
+            );
+        }
+        // Invalid UTF-8 or a control byte anywhere else is refused too.
+        for text in [
+            &b"maxpack-image 1\xff\np5z/a.p5z\n0 64 1\n"[..],
+            b"maxpack-image 1\np5z/a.p5z\n0 64 1\n\xc3",
+            b"maxpack-image 1\np5z/a.p5z\n0\t64 1\n",
+            b"maxpack-image 1\np5z/a.p5z\n0 64 1\x7f\n",
+        ] {
+            assert!(matches!(parse(text), Err(P5zError::Image(_))), "{text:?}");
+        }
     }
 
     fn volumes(n: usize) -> String {

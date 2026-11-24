@@ -1,6 +1,6 @@
 name: Game report
-description: Report how a game runs with this build of ampr-emu-ng (MaxPack's fork), working or not. English or Spanish.
-title: "[PPSAxxxxx] Game name: short result"
+description: Report how a game runs with this build of ampr-emu-ng (MaxPack's fork), working or not, without naming it. English or Spanish.
+title: "[Game report] Format, loader: short result"
 labels: ["test report"]
 body:
   - type: markdown
@@ -9,14 +9,80 @@ body:
         Thanks for testing. Reports that a game works are just as useful as crash reports.
         This is MaxPack's fork of ampr-emu-ng. A problem that also happens with quer3q's
         build belongs to [upstream](https://github.com/quer3q/ampr-emu-ng).
-        One game per issue. Search open and closed issues for the title ID first; if it is
-        there, add a comment instead.
+        One game per issue.
+
+        **You don't need to name the game.** MaxPack's
+        [compatibility list](https://github.com/DeLFuS77/maxpack-ps5/blob/main/docs/compatibility.md)
+        identifies games only by their numbers (sizes, volumes and setup), with no game name and no
+        title ID, so please leave both out of the title, the fields and the description.
 
   - type: input
-    id: game
+    id: sizes
     attributes:
-      label: Game, title ID and game version
-      placeholder: "CONTROL Resonant, PPSA34547, 01.002"
+      label: Original → .p5z (or folder)
+      description: The game's size before and after packing, in GiB.
+      placeholder: "69.0 → 33.2 GiB"
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      description: How the game is on the drive.
+      options:
+        - p5z (played without installing, with MaxPack for the console)
+        - zstd folder
+        - LZ4 folder
+        - pkg (debug FPKG)
+        - plain folder (unpacked)
+        - Other (say which below, e.g. an .ffpkg image)
+    validations:
+      required: true
+
+  - type: input
+    id: volumes
+    attributes:
+      label: Volumes
+      description: For a .p5z, how many volumes it has (`maxpack info` on the PC shows it). Leave empty for the other formats.
+      placeholder: "9"
+
+  - type: dropdown
+    id: drive
+    attributes:
+      label: Drive
+      description: Where the game is. Say how it is connected below when it matters (an M.2 SSD in a USB-C enclosure is a USB SSD).
+      options:
+        - Internal SSD
+        - M.2 SSD (console slot)
+        - USB SSD
+        - USB HDD
+        - Other (say which below)
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Console firmware
+      description: Settings > System > System Software.
+      placeholder: "13.60"
+    validations:
+      required: true
+
+  - type: input
+    id: loader
+    attributes:
+      label: Loader/mounter and version
+      description: The one that mounted the game, e.g. MaxPack 1.0.0 or ShadowMountPlus 1.7beta12.
+      placeholder: "ShadowMountPlus 1.7beta12"
+    validations:
+      required: true
+
+  - type: input
+    id: fakelib
+    attributes:
+      label: Fakelib mode
+      description: MaxPack's Fakelib setting on the game's sheet (Full, Emulators only or Off), or the loader's own mode for the game (and, with ShadowMountPlus, whether fakelib updates are off).
+      placeholder: "Full"
     validations:
       required: true
 
@@ -54,6 +120,12 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: packer
+    attributes:
+      label: Packer and version
+      placeholder: "MaxPack 1.0.0, ps5-dump-forge x.y"
+
   - type: dropdown
     id: result
     attributes:
@@ -68,17 +140,12 @@ body:
     validations:
       required: true
 
-  - type: textarea
-    id: setup
+  - type: input
+    id: date
     attributes:
-      label: Setup
-      description: Firmware, loader and its version, packer and its version, install type and storage.
-      value: |
-        Firmware:
-        Loader (e.g. maxpack-ps5 x.y, ShadowMountPlus x.y), fakelib updates off: yes/no
-        Packer (e.g. MaxPack x.y, ps5-dump-forge x.y):
-        Install: folder / .p5z (maxpack-ps5) / ffpkg / pkg
-        Storage: internal SSD / extended M.2 / USB exFAT
+      label: Date of the test
+      description: The real date, YYYY-MM-DD (the clock of an offline console is often years behind).
+      placeholder: "2026-11-24"
     validations:
       required: true
 
@@ -86,7 +153,7 @@ body:
     id: what
     attributes:
       label: What happened
-      description: What you did and what you saw. Where it fails, any error code. Does the same dump run without packs, or with v0.2.0?
+      description: What you did and what you saw, with no game name or title ID. Where it fails, any error code. Does the same dump run without packs, or with v0.2.0?
     validations:
       required: true
 

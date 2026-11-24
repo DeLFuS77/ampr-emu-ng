@@ -72,9 +72,10 @@ copies two files to the project root:
 - `libSceAmpr-debug.sprx`, the same runtime plus metrics, tuning and
   failure logs, for testing ([docs/debug-build.md](docs/debug-build.md)).
 
-Every push to main also publishes both files as the
-[beta pre-release](https://github.com/DeLFuS77/ampr-emu-ng/releases/tag/beta);
-its launch notice reads `v<version>-beta.<commit>`.
+Once this repository is published, every push to main also publishes both
+files as the `beta` pre-release under
+[Releases](https://github.com/DeLFuS77/ampr-emu-ng/releases); there is none
+before that. A beta's launch notice reads `v<version>-beta.<commit>`.
 
 Design notes, the memory budget, the PRX size rule and how a change is
 checked are in [DESIGN.md](DESIGN.md).

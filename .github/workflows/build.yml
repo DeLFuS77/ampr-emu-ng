@@ -3,19 +3,32 @@
 name: build
 
 on:
-  # Every push (any branch or tag) runs tests and builds; only v* tags release.
+  # Every push to a branch runs the host tests, except one that only changes
+  # docs (Actions minutes are limited). The .sprx build runs only where a PRX
+  # is needed (see the sprx job). A v* tag always builds (GitHub never applies
+  # path filters to tags) and releases.
   push:
     branches: ['**']
-    tags: ['**']
+    tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request cancels the older run; a
+# tag's run is never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
@@ -41,6 +54,14 @@ jobs:
 
   sprx:
     name: build sprx
+    # The Docker build only where a PRX is used: main (the beta), v* tags (the
+    # release), a manual run, and ng-* branches (PRX builds vendored by
+    # maxpack-ps5). Other branches and pull requests get the host tests only.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/tags/v')
+      || startsWith(github.ref, 'refs/heads/ng-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -96,8 +117,9 @@ jobs:
 
   # One pre-release, tag `beta`, updated in place on every push to main: a
   # fixed download URL, the "Latest" badge stays on the last v* release, and
-  # release watchers are not notified per push. Runs on main are serialized
-  # by the workflow concurrency group, so an older build never lands last.
+  # release watchers are not notified per push. Runs on main share the
+  # workflow concurrency group (a newer push cancels the older run), so an
+  # older build never lands last.
   # The tag moves through GITHUB_TOKEN, which starts no new workflow run.
   beta:
     name: beta

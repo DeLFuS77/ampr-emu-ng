@@ -3,8 +3,9 @@
 <p align="center"><b>The runtime inside the game: it serves a PS5 game's packed files and decompresses them on the fly, now also straight from a single <code>.p5z</code> file.</b></p>
 
 <p align="center">
+  <a href="https://ko-fi.com/delfus77"><img src="https://img.shields.io/badge/Support_on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white" alt="Support on Ko-fi"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/DeLFuS77/ampr-emu-ng" alt="Licence: GPL-3.0-or-later"></a>
-  <a href="https://github.com/DeLFuS77/ampr-emu-ng/releases/latest"><img src="https://img.shields.io/github/v/release/DeLFuS77/ampr-emu-ng" alt="Latest release"></a>
+  <a href="https://github.com/DeLFuS77/ampr-emu-ng/releases"><img src="https://img.shields.io/github/v/release/DeLFuS77/ampr-emu-ng?sort=semver" alt="Release"></a>
   <a href="https://github.com/DeLFuS77/ampr-emu-ng/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/DeLFuS77/ampr-emu-ng/build.yml?branch=main&label=build" alt="Build status"></a>
   <img src="https://img.shields.io/badge/upstream-quer3q%2Fampr--emu--ng%20v0.5.1-informational" alt="Based on quer3q/ampr-emu-ng v0.5.1">
 </p>
@@ -24,6 +25,18 @@ flowchart LR
     PACKS -->|"256 KiB blocks,<br/>decompressed on demand"| RT
 ```
 
+> [!NOTE]
+> **Status: first public release, help us test.** MaxPack 1.0.0, with this build of ampr-emu-ng
+> (`v0.5.1-maxpack.1`), is the first public release. It has been tested on one console (firmware
+> 13.60) with a handful of games, so expect rough edges. Testing on other firmwares, games and drives
+> is the most useful help right now: [here is how](#help-test-maxpack).
+
+<p align="center">
+  <a href="https://ko-fi.com/delfus77"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="36"></a>
+  <br>
+  <sub>❤️ Free and open source, and it will stay free. If it saves you time, a coffee helps keep it going.</sub>
+</p>
+
 ampr-emu-ng is a hard fork of [drakmor/ampr_emu](https://github.com/drakmor/ampr_emu), built by
 quer3q to run PKG, zstd, LZ4 and plain games quickly and reliably. It is a replacement for the PS5
 system library `libSceAmpr`, loaded from the game's own `fakelib/` folder.
@@ -32,6 +45,18 @@ system library `libSceAmpr`, loaded from the game's own `fakelib/` folder.
 based on upstream **v0.5.1**. It follows upstream and adds exactly one mode, **p5z**: the zstd volumes
 of a game are read straight from inside one `.p5z` file, so the PS5 needs no `.pak` files next to the
 game. A game without a `maxpack.image` runs exactly as with upstream.
+
+**Why the p5z mode matters.** It is what lets a PS5 game be played straight from one compressed `.p5z`
+file. Nothing is unpacked, so the game keeps its saving (40–70 % on the games tested), and only its
+small loose files go to the console's cache. On a real PS5 (firmware 13.60) it served games of 1, 9
+and 19 volumes from the internal SSD and from an external M.2 SSD over USB-C, at about 2 ms per read
+on the M.2 ([results](https://github.com/DeLFuS77/maxpack-ps5#tested-on-a-real-ps5)).
+
+**What this is.** A library that runs inside each game, not an app you start. MaxPack for the console
+bundles this build and puts it into the `fakelib/` of the games it mounts; you download it yourself
+only for ShadowMountPlus, or to choose it in MaxPack for the PC. Everything but the p5z mode is
+upstream's, quer3q's. **New to MaxPack? Start at the hub,**
+[DeLFuS77/maxpack](https://github.com/DeLFuS77/maxpack): the PC app, the quick start and the guide.
 
 ## Contents
 
@@ -44,7 +69,7 @@ game. A game without a `maxpack.image` runs exactly as with upstream.
 - [FAQ](#faq)
 - [Status](#status)
 - [Build](#build)
-- [Help and reports](#help-and-reports)
+- [Help test MaxPack](#help-test-maxpack)
 - [Legal and disclaimer](#legal-and-disclaimer)
 - [Credits and licence](#credits-and-licence)
 
@@ -66,7 +91,7 @@ versions are followed.
 ## The MaxPack family
 
 MaxPack is made of three projects that work together. Each one lives in its own repository and has
-its own releases.
+its own releases. The hub is [DeLFuS77/maxpack](https://github.com/DeLFuS77/maxpack): start there.
 
 ```mermaid
 flowchart TD
@@ -180,9 +205,17 @@ Everything else is quer3q's ampr-emu-ng v0.5.1, unchanged:
 
 Releases of this copy are named `v<upstream version>-maxpack.<n>`, for example `v0.5.1-maxpack.1`:
 the upstream version they are built on and a MaxPack revision. Each one carries `libSceAmpr.sprx`,
-`libSceAmpr-debug.sprx` and `SHA256SUMS`. The launch notice shows the upstream part only. Once this
-repository is published, every push to `main` also publishes both files as the `beta` pre-release,
-whose notice reads `v<version>-beta.<commit>`.
+`libSceAmpr-debug.sprx` and `SHA256SUMS`. The launch notice shows the upstream part only.
+
+- **Checked.** `sha256sum -c --ignore-missing SHA256SUMS` checks what you downloaded, and each file
+  also has a GitHub build attestation that proves it was built by this repository's workflow from the
+  tagged commit: `gh attestation verify libSceAmpr.sprx -R DeLFuS77/ampr-emu-ng`.
+- **Immutable.** Once a `v…-maxpack.N` release is published, its files cannot be replaced.
+- **Pinned in MaxPack.** MaxPack for the console bundles a release's `libSceAmpr.sprx`, and its build
+  checks that file against the release's `SHA256SUMS`.
+
+Once this repository is published, every push to `main` also publishes both files as the `beta`
+pre-release, whose notice reads `v<version>-beta.<commit>`.
 
 ## Requirements
 
@@ -203,7 +236,8 @@ and for folder games through a setting that is on by default.
 **With ShadowMountPlus** (packed folders):
 
 1. Download `libSceAmpr.sprx` and `SHA256SUMS` from
-   [Releases](https://github.com/DeLFuS77/ampr-emu-ng/releases) and check the file.
+   [Releases](https://github.com/DeLFuS77/ampr-emu-ng/releases) and check the file
+   ([how](#releases)).
 2. Put it in the game's `fakelib/`: in MaxPack for the PC, choose it in **Settings** and pack the
    game (it goes into the `fakelib/` of games that do not carry one that reads zstd), or copy it there
    by hand.
@@ -281,8 +315,9 @@ packs, which the service could not open by itself.
 <details>
 <summary><b>Where do I report a problem?</b></summary>
 
-A problem with a `.p5z` game, here. A problem that also happens with upstream's build belongs to
-[upstream](https://github.com/quer3q/ampr-emu-ng) too.
+A game played with MaxPack for the console, in [maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5/issues);
+a problem in this runtime itself, here. A problem that also happens with upstream's build belongs to
+[upstream](https://github.com/quer3q/ampr-emu-ng) too. See [Help test MaxPack](#help-test-maxpack).
 </details>
 
 ## Status
@@ -290,11 +325,12 @@ A problem with a `.p5z` game, here. A problem that also happens with upstream's 
 | Area | State |
 |---|---|
 | zstd mode (upstream code), in MaxPack's build | **Tested on a real PS5**: firmware 13.60, ShadowMountPlus 1.7beta12, with a game packed by MaxPack for the PC; it boots, saves and loads. |
-| p5z mode | Done and tested on the PC: host tests with real `.p5z` files made by the MaxPack engine (one volume and seven volumes) and with broken copies of them. **Not run on a console yet.** |
+| p5z mode | **Tested on a real PS5**: firmware 13.60, with MaxPack for the console, three games of 1, 9 and 19 volumes, from the internal SSD and an external M.2 SSD over USB-C, at about 2 ms per read on the M.2 ([results](https://github.com/DeLFuS77/maxpack-ps5#tested-on-a-real-ps5)). On the PC, host tests with real `.p5z` files made by the MaxPack engine (one volume and seven volumes) and with broken copies of them. |
 | pkg, lz4 and plain modes | Upstream v0.5.1, unchanged. |
 
 Which games have been tried, and how, is in MaxPack's
 [compatibility list](https://github.com/DeLFuS77/maxpack-ps5/blob/main/docs/compatibility.md).
+Tried one? See [Help test MaxPack](#help-test-maxpack).
 
 ## Build
 
@@ -316,13 +352,25 @@ project root:
 Design notes, the memory budget, the PRX size rule and how a change is checked are in
 [DESIGN.md](DESIGN.md).
 
-## Help and reports
+## Help test MaxPack
 
-Game reports, bug reports and ideas are welcome, in English or Spanish: use the
-[issue templates](https://github.com/DeLFuS77/ampr-emu-ng/issues/new/choose). Problems with MaxPack on
-the PC go to [maxpack](https://github.com/DeLFuS77/maxpack/issues), problems on the console to
-[maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5/issues). For a security problem, see
-[SECURITY.md](SECURITY.md).
+This build has run on one console so far. Reports from other firmwares, games and drives are the most
+useful help right now, and a game that works is as useful to know as one that does not. English or
+Spanish are both fine.
+
+- **A game with MaxPack for the console** (a `.p5z`, a packed folder or a `.pkg`): open a
+  [Game report](https://github.com/DeLFuS77/maxpack-ps5/issues/new?template=game_report.yml), or a
+  [Bug report](https://github.com/DeLFuS77/maxpack-ps5/issues/new?template=bug_report.yml) for a bug,
+  in maxpack-ps5. The game's **Copy report** on the console page fills most of it, and the result goes
+  into the [compatibility list](https://github.com/DeLFuS77/maxpack-ps5/blob/main/docs/compatibility.md).
+- **This runtime under ShadowMountPlus or Kraken Mount**, or a problem in the runtime itself: open a
+  [Game report here](https://github.com/DeLFuS77/ampr-emu-ng/issues/new?template=game-report.yml), with
+  the launch notice and, if you can, the logs of the [debug build](docs/debug-build.md).
+- **Always say** which firmware, drive (internal SSD, USB SSD, hard drive, M.2) and loader you used.
+
+Problems with MaxPack on the PC go to [maxpack](https://github.com/DeLFuS77/maxpack/issues). A problem
+that also happens with upstream's build belongs to [upstream](https://github.com/quer3q/ampr-emu-ng)
+too. For a security problem, see [SECURITY.md](SECURITY.md).
 
 ## Legal and disclaimer
 

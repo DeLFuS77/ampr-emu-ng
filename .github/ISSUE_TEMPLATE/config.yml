@@ -1,1 +1,11 @@
 blank_issues_enabled: false
+contact_links:
+  - name: MaxPack user guide
+    url: https://github.com/DeLFuS77/maxpack/blob/main/docs/guide.md
+    about: How to pack a game into a .p5z and play it on the console.
+  - name: MaxPack for the console (payload)
+    url: https://github.com/DeLFuS77/maxpack-ps5/issues
+    about: Problems with the payload (mounting, installing, the page) belong there.
+  - name: Upstream ampr-emu-ng (quer3q)
+    url: https://github.com/quer3q/ampr-emu-ng/issues
+    about: A problem that also happens with the upstream build belongs to upstream.

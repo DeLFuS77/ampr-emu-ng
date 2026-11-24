@@ -1,5 +1,5 @@
 name: Game report
-description: Report how a game runs with ampr-emu-ng, working or not.
+description: Report how a game runs with this build of ampr-emu-ng (MaxPack's fork), working or not. English or Spanish.
 title: "[PPSAxxxxx] Game name: short result"
 labels: ["test report"]
 body:
@@ -7,6 +7,8 @@ body:
     attributes:
       value: |
         Thanks for testing. Reports that a game works are just as useful as crash reports.
+        This is MaxPack's fork of ampr-emu-ng. A problem that also happens with quer3q's
+        build belongs to [upstream](https://github.com/quer3q/ampr-emu-ng).
         One game per issue. Search open and closed issues for the title ID first; if it is
         there, add a comment instead.
 
@@ -22,8 +24,8 @@ body:
     id: version
     attributes:
       label: ampr-emu-ng version
-      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.1 (zstd) running" or, for a beta, "v0.5.1-beta.abc1234". For a test build, name the zip.'
-      placeholder: "v0.5.1"
+      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.1 (p5z) running" (the upstream part of the release name, v0.5.1-maxpack.1) or, for a beta, "v0.5.1-beta.abc1234". For a test build, name the zip.'
+      placeholder: "v0.5.1-maxpack.1"
     validations:
       required: true
 
@@ -43,8 +45,10 @@ body:
       label: Packs
       description: The mode in the launch notification.
       options:
+        - p5z (zstd volumes read from a .p5z)
         - zstd
         - lz4
+        - pkg
         - plain (no packs)
         - no notification shown
     validations:
@@ -71,9 +75,9 @@ body:
       description: Firmware, loader and its version, packer and its version, install type and storage.
       value: |
         Firmware:
-        Loader (e.g. ShadowMountPlus x.y), fakelib updates off: yes/no
-        Packer (e.g. ps5-dump-forge x.y):
-        Install: folder / ffpkg / pkg
+        Loader (e.g. maxpack-ps5 x.y, ShadowMountPlus x.y), fakelib updates off: yes/no
+        Packer (e.g. MaxPack x.y, ps5-dump-forge x.y):
+        Install: folder / .p5z (maxpack-ps5) / ffpkg / pkg
         Storage: internal SSD / extended M.2 / USB exFAT
     validations:
       required: true

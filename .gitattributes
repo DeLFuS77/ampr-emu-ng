@@ -1,0 +1,2 @@
+# Binary and byte-exact: no line-ending conversion.
+crates/ampr-format/tests/fixtures/p5z/* -text

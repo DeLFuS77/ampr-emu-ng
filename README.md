@@ -207,9 +207,11 @@ Releases of this copy are named `v<upstream version>-maxpack.<n>`, for example `
 the upstream version they are built on and a MaxPack revision. Each one carries `libSceAmpr.sprx`,
 `libSceAmpr-debug.sprx` and `SHA256SUMS`. The launch notice shows the upstream part only.
 
-- **Checked.** `sha256sum -c --ignore-missing SHA256SUMS` checks what you downloaded, and each file
-  also has a GitHub build attestation that proves it was built by this repository's workflow from the
-  tagged commit: `gh attestation verify libSceAmpr.sprx -R DeLFuS77/ampr-emu-ng`.
+- **Checked.** `sha256sum -c --ignore-missing SHA256SUMS` checks what you downloaded. From the release
+  after `v0.5.1-maxpack.1` on, each file also has a GitHub build attestation that proves it was built by
+  this repository's workflow from the tagged commit: `gh attestation verify libSceAmpr.sprx -R DeLFuS77/ampr-emu-ng`.
+  `v0.5.1-maxpack.1` came before that step; its `libSceAmpr.sprx` is byte-identical to the one inside
+  MaxPack for the console 1.0.0, whose `maxpack.elf` is attested.
 - **Immutable.** Once a `v…-maxpack.N` release is published, its files cannot be replaced.
 - **Pinned in MaxPack.** MaxPack for the console bundles a release's `libSceAmpr.sprx`, and its build
   checks that file against the release's `SHA256SUMS`.

@@ -101,6 +101,7 @@ jobs:
   # The tag moves through GITHUB_TOKEN, which starts no new workflow run.
   beta:
     name: beta
+    # Día de la publicación: volver a poner if: github.ref == 'refs/heads/main'
     if: false # CI: sin publicar mientras el repositorio es privado
     needs: [test, sprx]
     runs-on: ubuntu-latest

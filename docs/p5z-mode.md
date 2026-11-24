@@ -132,7 +132,14 @@ Every volume is read from the `.p5z`: each volume opens it as its own fd
 the windows and the chunk offsets stay offsets inside the volume; only the
 kernel read adds the volume's region start (`PackHandle.base`, 0 for a
 volume that is its own file). The sum is checked and must fit `off_t`; the
-region checks above already keep it inside the `.p5z`.
+region checks above already keep it inside the `.p5z`. It is added once,
+where a window's read request is built (`prepare_exact_window_aio` in
+`rt/pack/window_aio.rs`); the pread pool (up to 8 threads) and kernel AIO
+both take that request as it is, and lane EOP overlap
+(`rt/reactor/lane_overlap.rs`) changes only when a command buffer's reads
+are issued, not where they read. The volume header is read at the region
+start too, at start-up and at each open (`validate_data_header_zstd` in
+`rt/pack/leases.rs`), and the debug `/bench` adds the same base.
 
 ## When a check fails
 

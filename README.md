@@ -12,11 +12,16 @@ PS5 needs no `.pak` files next to the game
 ([docs/p5z-mode.md](docs/p5z-mode.md)). A game without a `maxpack.image`
 runs exactly as with upstream.
 
-- [MaxPack](https://github.com/DeLFuS77/maxpack) is the PC tool that packs
-  a game into a `.p5z`, and has the user guide (in Spanish).
-- [maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5) is the PS5 payload
-  that mounts a `.p5z` game, writes its `maxpack.image` and ships this
+MaxPack is made of three repositories:
+
+- [DeLFuS77/maxpack](https://github.com/DeLFuS77/maxpack) is the PC app and
+  command line that pack a game into a `.p5z`, and has the
+  [user guide](https://github.com/DeLFuS77/maxpack/blob/main/docs/guide.md).
+- [DeLFuS77/maxpack-ps5](https://github.com/DeLFuS77/maxpack-ps5) is the PS5
+  payload that mounts a `.p5z` game, writes its `maxpack.image` and ships this
   `libSceAmpr.sprx`.
+- [DeLFuS77/ampr-emu-ng](https://github.com/DeLFuS77/ampr-emu-ng) is this
+  repository.
 
 Releases of this copy are named `v<upstream version>-maxpack.<n>`, for
 example `v0.5.1-maxpack.1`: the upstream version it is built on and a
@@ -73,6 +78,19 @@ its launch notice reads `v<version>-beta.<commit>`.
 
 Design notes, the memory budget, the PRX size rule and how a change is
 checked are in [DESIGN.md](DESIGN.md).
+
+## Legal note
+
+This project ships no games and nothing copyrighted, and it touches no keys,
+encryption or DRM. It is meant for backups of games you own, dumped from your
+own console. It is not affiliated with or endorsed by Sony.
+
+## Help and reports
+
+Game reports, bug reports and ideas are welcome, in English or Spanish: use the
+[issue templates](https://github.com/DeLFuS77/ampr-emu-ng/issues/new/choose).
+For a security problem, see [SECURITY.md](SECURITY.md). What changed in each
+release is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Thanks
 

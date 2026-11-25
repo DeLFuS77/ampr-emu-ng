@@ -205,4 +205,10 @@ ampr-emu-ng: v<version> (p5z) running
 
 The debug build writes how the check ended to the black box
 (`/data/ampr_emu_trace.txt`): `p5z <how> <volume> <path> <rule>`, then
-`mode <label>`.
+`mode <label>`. When the mount then refuses `ampr_zstd.index`, which
+the notice already sent cannot say, it also writes `p5z mount <how>
+<volume>`: `overlap` or `past-end` with the volume they are in (the
+rules of [Growing a `.p5z`](#growing-a-p5z)), `crc` (the payload CRC),
+`read` (a read error), `invalid` (any other index check) or `tables`
+(no room for the chunk and volume tables). The release build writes
+nothing more: as in zstd mode, no packed file is served.

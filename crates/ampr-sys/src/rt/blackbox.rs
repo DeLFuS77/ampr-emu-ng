@@ -149,6 +149,16 @@ pub(crate) fn p5z(how: &[u8], volume: u64, path: &[u8], rule: &[u8]) {
     l.s(b" ").s(rule).emit();
 }
 
+/// A p5z mount whose index was refused (rt/pack/zstd.rs `open_p5z`):
+/// "p5z mount <how> <volume>", `how` the rule (`p5z_refusal`), `volume`
+/// the one an overlap or a chunk past the end is in (0 otherwise).
+pub(crate) fn p5z_mount(how: &[u8], volume: u64) {
+    if FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    Line::new().s(b"p5z mount ").s(how).s(b" ").x(volume).emit();
+}
+
 /// The mode the load notice names (rt/pack/mod.rs `mode_label`):
 /// "mode <label>".
 pub(crate) fn mode(label: &[u8]) {

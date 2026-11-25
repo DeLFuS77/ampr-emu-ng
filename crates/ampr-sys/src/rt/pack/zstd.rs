@@ -270,11 +270,46 @@ unsafe fn mount_from_file(b: &mut Builder<'_>, p5z: bool, chunks: u64, volumes: 
 /// same blocks as zstd mode. `chunks` and `volumes` are the header's
 /// counts; `open_p5z` refuses an index whose chunk count differs. None
 /// when the block is refused or the index is; a block taken stays in
-/// `mount` for the caller's release.
+/// `mount` for the caller's release. The debug build writes why to the
+/// black box (`p5z mount <how> <volume>`, `p5z_refusal`): the start-up
+/// notice has already gone out, and a refusal here is what a bad grown
+/// `.p5z` meets first.
 unsafe fn open_p5z(mount: &mut ZstdMount, chunks: u64, volumes: u32) -> Option<ZstdIndex> {
     let c = usize::try_from(chunks).ok()?;
-    let tables = unsafe { take_tables(mount, c, volumes as usize) }?;
-    Index::open_p5z(&ZSTD_FILE, &mut tables[..c]).ok()
+    let Some(tables) = (unsafe { take_tables(mount, c, volumes as usize) }) else {
+        #[cfg(feature = "mem_report")]
+        log_p5z_refusal(None);
+        return None;
+    };
+    let opened = Index::open_p5z(&ZSTD_FILE, &mut tables[..c]);
+    #[cfg(feature = "mem_report")]
+    if let Err(e) = opened {
+        log_p5z_refusal(Some(e));
+    }
+    opened.ok()
+}
+
+/// Why a p5z mount was refused, in the black box words: the rule, and the
+/// volume it names (0 when it names none). `None`: the tables block was
+/// refused.
+#[cfg(any(test, feature = "mem_report"))]
+fn p5z_refusal(e: Option<ampr_format::zstd::P5zOpenError>) -> (&'static [u8], u32) {
+    use ampr_format::zstd::P5zOpenError as E;
+    use ampr_format::Error;
+    match e {
+        None => (b"tables", 0),
+        Some(E::Overlap { volume }) => (b"overlap", volume),
+        Some(E::PastEnd { volume }) => (b"past-end", volume),
+        Some(E::Index(Error::Checksum)) => (b"crc", 0),
+        Some(E::Index(Error::Io)) => (b"read", 0),
+        Some(E::Index(_)) => (b"invalid", 0),
+    }
+}
+
+#[cfg(feature = "mem_report")]
+fn log_p5z_refusal(e: Option<ampr_format::zstd::P5zOpenError>) {
+    let (how, volume) = p5z_refusal(e);
+    crate::rt::blackbox::p5z_mount(how, u64::from(volume));
 }
 
 /// The chunk and volume tables block, one Index allocation of 8 B per
@@ -303,7 +338,11 @@ unsafe fn take_tables(
 /// same counts): chunk records and volume sizes then read memory only,
 /// which the read jobs need. None when the allocation is refused or on a
 /// read error; a block taken stays in `mount` for the caller's release.
-unsafe fn attach_chunks(index: ZstdIndex, mount: &mut ZstdMount) -> Option<ZstdIndex> {
+/// Any source: the mount's is `ZSTD_FILE`, a test's can fail on demand.
+unsafe fn attach_chunks<S: Source + ?Sized>(
+    index: Index<'static, S>,
+    mount: &mut ZstdMount,
+) -> Option<Index<'static, S>> {
     let (c, v) = index.chunk_lens();
     let all = if mount.tables.is_null() {
         unsafe { take_tables(mount, c, v) }?
@@ -1185,7 +1224,9 @@ mod tests {
     /// zstd mode refuses it. The p5z mount's sorted copy of the chunks is
     /// the chunk part of the tables block, filled in chunk order after the
     /// open: the mounted tables are the index's, and the release gives
-    /// back every byte, as after the refused zstd mount.
+    /// back every byte, as after the refused zstd mount. A copy with two
+    /// chunks overlapping is refused by the p5z rules after the block was
+    /// taken; the block stays in the mount for the release.
     #[test]
     fn a_p5z_mount_takes_chunks_in_any_order() {
         use ampr_format::zstd::Rules;
@@ -1203,6 +1244,26 @@ mod tests {
         let mut sorted = vec![0u64; chunks];
         let plain = Index::open_p5z(image, &mut sorted).unwrap();
         assert_eq!((plain.chunk_count() as usize, plain.volume_count()), (chunks, 2));
+        // The chunk right after volume 0's first one, one byte earlier.
+        let at_offset = |offset: u32| {
+            (0..chunks as u32)
+                .find(|&id| {
+                    let c = plain.chunk(id).unwrap();
+                    (c.volume_id, c.offset) == (0, offset)
+                })
+                .unwrap()
+        };
+        let second = at_offset(64 + plain.chunk(at_offset(64)).unwrap().stored_size);
+        let mut overlapping = image.to_vec();
+        let chunks_at = u64::from_le_bytes(image[64..72].try_into().unwrap()) as usize;
+        let at = chunks_at + 8 * second as usize;
+        let c = u64::from_le_bytes(overlapping[at..at + 8].try_into().unwrap());
+        overlapping[at..at + 8].copy_from_slice(&(c - 1).to_le_bytes());
+        let crc = ampr_format::crc32(&overlapping[128..]);
+        overlapping[112..116].copy_from_slice(&crc.to_le_bytes());
+        let overlapping: &'static [u8] = overlapping.leak();
+        let refused = Index::open_p5z(overlapping, &mut sorted).err();
+        assert_eq!(p5z_refusal(refused), (&b"overlap"[..], 0));
         let paths: Vec<Vec<u8>> = files
             .iter()
             .map(|(p, _)| format!("/app0/{p}").into_bytes())
@@ -1222,6 +1283,14 @@ mod tests {
             zstd_mount_release();
             assert_eq!(im::test_index_used(), used);
 
+            assert!(!mount_image_as(overlapping, b, true));
+            let mount = &*ZSTD_MOUNT.get();
+            assert!(mount.index.is_none() && !mount.tables.is_null());
+            assert_eq!(mount.tables_bytes, table_bytes(chunks as u64, 2));
+            zstd_mount_release();
+            assert!((*ZSTD_MOUNT.get()).tables.is_null());
+            assert_eq!(im::test_index_used(), used);
+
             assert!(mount_image_as(image, b, true));
             let mount = &*ZSTD_MOUNT.get();
             assert_eq!(mount.tables_bytes, table_bytes(chunks as u64, 2));
@@ -1239,6 +1308,63 @@ mod tests {
             assert_eq!(im::test_index_used(), used);
         }
         crate::rt::index::tests::drop_view(&mut idx);
+    }
+
+    /// The black box words for each way a p5z mount is refused
+    /// (`blackbox::p5z_mount`): which rule, and the volume it names.
+    #[test]
+    fn p5z_refusals_have_short_names() {
+        use ampr_format::zstd::P5zOpenError as E;
+        use ampr_format::Error;
+        let cases: [(Option<E>, (&[u8], u32)); 8] = [
+            (None, (b"tables", 0)),
+            (Some(E::Overlap { volume: 3 }), (b"overlap", 3)),
+            (Some(E::PastEnd { volume: 7 }), (b"past-end", 7)),
+            (Some(E::Index(Error::Checksum)), (b"crc", 0)),
+            (Some(E::Index(Error::Io)), (b"read", 0)),
+            (Some(E::Index(Error::Invalid)), (b"invalid", 0)),
+            (Some(E::Index(Error::Truncated)), (b"invalid", 0)),
+            (Some(E::Index(Error::OutOfRange)), (b"invalid", 0)),
+        ];
+        for (e, want) in cases {
+            assert_eq!(p5z_refusal(e), want, "{e:?}");
+        }
+    }
+
+    /// A read error while the tables are filled (zstd mode) fails the
+    /// mount with the block in the mount, not freed on the spot: the
+    /// caller's release (`load_zstd_manifest`) gives every byte back.
+    #[test]
+    fn a_tables_read_error_leaves_the_block_for_the_release() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        struct Flaky(&'static [u8], AtomicBool);
+        impl Source for Flaky {
+            fn len(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+                if self.1.load(SeqCst) {
+                    return Err(ampr_format::Error::Io);
+                }
+                self.0.read_at(at, out)
+            }
+        }
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let image: &'static [u8] = build_index(TREE, ("Data/B.bin", 1)).leak();
+        let src: &'static Flaky = Box::leak(Box::new(Flaky(image, AtomicBool::new(false))));
+        let index = Index::open(src).unwrap();
+        src.1.store(true, SeqCst);
+        unsafe {
+            let used = im::test_index_used();
+            let mount = &mut *ZSTD_MOUNT.get();
+            *mount = ZstdMount::EMPTY;
+            assert!(attach_chunks(index, mount).is_none());
+            assert!(!mount.tables.is_null());
+            assert!(im::test_index_used() > used);
+            zstd_mount_release();
+            assert!((*ZSTD_MOUNT.get()).tables.is_null());
+            assert_eq!(im::test_index_used(), used);
+        }
     }
 
     /// A p5z mount needs the Index room a zstd mount needs and not a byte

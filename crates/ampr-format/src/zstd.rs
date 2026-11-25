@@ -420,7 +420,7 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     /// One pass over the records through the source. Two path buffers hold
     /// the current and the previous path for the order check. Where the
     /// chunks sit is checked in the same pass (`Rules::Pack`), or, given
-    /// `sorted` (`Rules::P5z`), after it (`check_tiling`).
+    /// `sorted` (`Rules::P5z`), after it (`open_p5z`, `check_placement`).
     fn validate(&self, mut sorted: Option<&mut [u64]>) -> Result<()> {
         if sorted
             .as_ref()

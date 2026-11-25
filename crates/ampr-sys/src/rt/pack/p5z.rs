@@ -281,7 +281,9 @@ fn check_with_index<D: P5zDisk>(
 /// The .p5z header, then each volume: its size from the index's volume
 /// table, its region (`check_region`: the volume's size, past the header,
 /// before the footer, no overflow) and the 64 bytes at the region start,
-/// compared as `ampr_format::zstd::volume_header` compares them.
+/// compared as `ampr_format::zstd::volume_header` compares them under p5z
+/// rules (`Rules::P5z`): a header written before the .p5z grew counts
+/// fewer volumes than the index.
 fn check_volumes<D: P5zDisk>(
     d: &mut D,
     index: c_int,
@@ -307,7 +309,7 @@ fn check_volumes<D: P5zDisk>(
         let volume_size = u64::from_le_bytes(record);
         check_region(k, region, size, volume_size).map_err(P5zFail::Check)?;
         if !d.pread_full(fd, &mut h, region.start)
-            || volume_header_for(&h, k, v.count, &v.archive_id, volume_size, Rules::Pack).is_err()
+            || volume_header_for(&h, k, v.count, &v.archive_id, volume_size, Rules::P5z).is_err()
         {
             return Err(P5zFail::Check(P5zError::Volume(k)));
         }
@@ -776,6 +778,36 @@ mod tests {
             refused_multi(move |d| *d.bytes(P5Z_IMAGE) = text),
             P5zFail::Check(Image(_))
         ));
+    }
+
+    /// A volume header written before the .p5z grew counts the volumes the
+    /// .p5z had then: the start-up check takes it (p5z rules), one volume
+    /// at a time or all at once, but not a header that counts more volumes
+    /// than the index.
+    #[test]
+    fn p5z_check_takes_volume_headers_written_before_the_p5z_grew() {
+        use P5zError::*;
+        let with_count = |k: usize, count: u32| {
+            let at = M_REGIONS[k].0 as usize;
+            move |d: &mut Mem| {
+                let p = d.bytes(M_GAME);
+                p[at + 20..at + 24].copy_from_slice(&count.to_le_bytes());
+                reseal(p, at, 64, 60);
+            }
+        };
+        let volumes = M_REGIONS.len();
+        for k in 0..volumes {
+            let mut disk = Mem::multi();
+            with_count(k, k as u32 + 1)(&mut disk);
+            assert_eq!(run(&mut disk).0, Ok(()), "volume {k}");
+            let over = refused_multi(with_count(k, volumes as u32 + 1));
+            assert_eq!(over, P5zFail::Check(Volume(k as u32)), "volume {k}");
+        }
+        let mut disk = Mem::multi();
+        for k in 0..volumes {
+            with_count(k, k as u32 + 1)(&mut disk);
+        }
+        assert_eq!(run(&mut disk).0, Ok(()));
     }
 
     /// Every failure text fits the notice line (exports.rs `NOTICE_MAX`).

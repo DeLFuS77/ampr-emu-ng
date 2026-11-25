@@ -167,10 +167,11 @@ fn table_bytes(chunks: u64, volumes: u64) -> usize {
 }
 
 /// manifest.rs `load_manifest`: mounts the open index file `fd` of `len`
-/// bytes (`zstd_mount_join`), then closes `fd`.
+/// bytes (`zstd_mount_join`, with p5z rules when maxpack.image was there
+/// at module_start), then closes `fd`.
 pub(crate) unsafe fn zstd_mount_fd(fd: c_int, len: u64, b: &mut Builder<'_>) -> bool {
     MOUNT_FD.store(fd, Ordering::Relaxed);
-    let ok = unsafe { zstd_mount_join(len, read_mount, b) };
+    let ok = unsafe { zstd_mount_join(len, read_mount, b, p5z_active()) };
     MOUNT_FD.store(-1, Ordering::Relaxed);
     if let Some(close_fn) = unsafe { real_close() } {
         unsafe { close_fn(fd) };
@@ -179,16 +180,22 @@ pub(crate) unsafe fn zstd_mount_fd(fd: c_int, len: u64, b: &mut Builder<'_>) -> 
 }
 
 /// Mounts the `len`-byte index file `read` reads: the full `Index::open`
-/// validation (its CRC pass included), the runtime caps, the chunk and
-/// volume tables filled into one Index block, then the join to the view
-/// `b` (`view_join::join_zstd` sets each packed row's first chunk and
-/// links it for the listings). The header alone sizes the tables first,
-/// so an index whose tables and windows do not fit the Index room is
-/// refused with the index notice before the file is read. On failure the
-/// caller releases what it took (`zstd_mount_release`), and rows already
-/// joined stay linked in `b`: readers gate on `LOAD_STATE`, which the
-/// caller sets invalid.
-pub(crate) unsafe fn zstd_mount_join(len: u64, read: ReadAt, b: &mut Builder<'_>) -> bool {
+/// validation (its CRC pass included; `Index::open_p5z` in p5z mode,
+/// `p5z`), the runtime caps, the chunk and volume tables filled into one
+/// Index block, then the join to the view `b` (`view_join::join_zstd` sets
+/// each packed row's first chunk and links it for the listings). The
+/// header alone sizes the tables first, so an index whose tables and
+/// windows do not fit the Index room is refused with the index notice
+/// before the file is read; p5z mode needs no more room (`open_p5z`). On
+/// failure the caller releases what it took (`zstd_mount_release`), and
+/// rows already joined stay linked in `b`: readers gate on `LOAD_STATE`,
+/// which the caller sets invalid.
+pub(crate) unsafe fn zstd_mount_join(
+    len: u64,
+    read: ReadAt,
+    b: &mut Builder<'_>,
+    p5z: bool,
+) -> bool {
     let mut head = [0u8; ampr_format::zstd::INDEX_HEADER_SIZE];
     if !read(0, &mut head) {
         return false;
@@ -219,16 +226,23 @@ pub(crate) unsafe fn zstd_mount_join(len: u64, read: ReadAt, b: &mut Builder<'_>
         len,
         reader: Some(FileSource::new(len, read, wa, wb)),
     };
-    let ok = unsafe { mount_from_file(b) };
+    let ok = unsafe { mount_from_file(b, p5z, chunks, volumes) };
     file.reader = None;
     unsafe { im::index_free(windows.cast(), c"apr.zstd.index.windows.release".as_ptr()) };
     ok
 }
 
 /// `zstd_mount_join` once `ZSTD_FILE` reads the file: the index, its
-/// tables and the join.
-unsafe fn mount_from_file(b: &mut Builder<'_>) -> bool {
-    let Ok(index) = Index::open(&ZSTD_FILE) else {
+/// tables and the join. `chunks` and `volumes` are the header's counts.
+unsafe fn mount_from_file(b: &mut Builder<'_>, p5z: bool, chunks: u64, volumes: u32) -> bool {
+    let mount = unsafe { &mut *ZSTD_MOUNT.get() };
+    *mount = ZstdMount::EMPTY;
+    let opened = if p5z {
+        unsafe { open_p5z(mount, chunks, volumes) }
+    } else {
+        Index::open(&ZSTD_FILE).ok()
+    };
+    let Some(index) = opened else {
         return false;
     };
     if index.file_count() > AMPR_EMU_PACK_MAX_FILES
@@ -238,8 +252,6 @@ unsafe fn mount_from_file(b: &mut Builder<'_>) -> bool {
     {
         return false;
     }
-    let mount = unsafe { &mut *ZSTD_MOUNT.get() };
-    *mount = ZstdMount::EMPTY;
     let Some(index) = (unsafe { attach_chunks(index, mount) }) else {
         return false;
     };
@@ -250,26 +262,61 @@ unsafe fn mount_from_file(b: &mut Builder<'_>) -> bool {
     joined
 }
 
-/// The chunk and volume tables, in one Index allocation filled by one
-/// pass over them: chunk records and volume sizes then read memory only,
-/// which the read jobs need. None when the
-/// allocation is refused or on a read error.
-unsafe fn attach_chunks(index: ZstdIndex, mount: &mut ZstdMount) -> Option<ZstdIndex> {
-    let (c, v) = index.chunk_lens();
-    let bytes = table_bytes(c as u64, v as u64).max(8);
+/// p5z mode: `Index::open_p5z`, whose check of where the chunks sit sorts
+/// a copy of them, 8 B per chunk. The copy is the chunk part of the tables
+/// block, taken here before the open instead of after it, and
+/// `attach_chunks` then fills that block in chunk order: p5z mode takes no
+/// Index room beyond the tables `zstd_mount_join` made room for, and the
+/// same blocks as zstd mode. `chunks` and `volumes` are the header's
+/// counts; `open_p5z` refuses an index whose chunk count differs. None
+/// when the block is refused or the index is; a block taken stays in
+/// `mount` for the caller's release.
+unsafe fn open_p5z(mount: &mut ZstdMount, chunks: u64, volumes: u32) -> Option<ZstdIndex> {
+    let c = usize::try_from(chunks).ok()?;
+    let tables = unsafe { take_tables(mount, c, volumes as usize) }?;
+    Index::open_p5z(&ZSTD_FILE, &mut tables[..c]).ok()
+}
+
+/// The chunk and volume tables block, one Index allocation of 8 B per
+/// chunk and per volume, kept in `mount` from here on so a failed mount
+/// gives it back (`zstd_mount_release`). None when it is refused.
+unsafe fn take_tables(
+    mount: &mut ZstdMount,
+    chunks: usize,
+    volumes: usize,
+) -> Option<&'static mut [u64]> {
+    let bytes = table_bytes(chunks as u64, volumes as u64).max(8);
     let p = unsafe { im::index_alloc(bytes, 8, c"apr.zstd.chunks".as_ptr()) }.cast::<u64>();
     if p.is_null() {
-        return None;
-    }
-    let all = unsafe { core::slice::from_raw_parts_mut(p, c + v) };
-    let (chunks, volumes) = all.split_at_mut(c);
-    if index.fill_chunks(chunks, volumes).is_err() {
-        unsafe { im::index_free(p.cast(), c"apr.zstd.chunks.invalid".as_ptr()) };
         return None;
     }
     mount.tables = p;
     mount.tables_bytes = bytes;
     stats::add(stats::Stat::IndexViewBytes, bytes as u64);
+    // SAFETY: the block holds `chunks + volumes` u64 (`table_bytes`, which
+    // the room check bounded), 8-aligned, used by this mount only.
+    Some(unsafe { core::slice::from_raw_parts_mut(p, chunks + volumes) })
+}
+
+/// The chunk and volume tables, filled by one pass over them into the
+/// tables block (`take_tables`; p5z mode took it before the open, for the
+/// same counts): chunk records and volume sizes then read memory only,
+/// which the read jobs need. None when the allocation is refused or on a
+/// read error; a block taken stays in `mount` for the caller's release.
+unsafe fn attach_chunks(index: ZstdIndex, mount: &mut ZstdMount) -> Option<ZstdIndex> {
+    let (c, v) = index.chunk_lens();
+    let all = if mount.tables.is_null() {
+        unsafe { take_tables(mount, c, v) }?
+    } else if mount.tables_bytes == table_bytes(c as u64, v as u64).max(8) {
+        // SAFETY: `take_tables` sized it for these counts.
+        unsafe { core::slice::from_raw_parts_mut(mount.tables, c + v) }
+    } else {
+        return None;
+    };
+    let (chunks, volumes) = all.split_at_mut(c);
+    if index.fill_chunks(chunks, volumes).is_err() {
+        return None;
+    }
     index.with_chunks(chunks, volumes).ok()
 }
 
@@ -1100,10 +1147,151 @@ mod tests {
         true
     }
 
-    /// Mounts `image` through `zstd_mount_join` into `b`.
+    /// Mounts `image` through `zstd_mount_join` into `b`, zstd mode.
     unsafe fn mount_image(image: &'static [u8], b: &mut Builder<'_>) -> bool {
+        unsafe { mount_image_as(image, b, false) }
+    }
+
+    /// `mount_image` in p5z mode (`p5z`) or zstd mode.
+    unsafe fn mount_image_as(image: &'static [u8], b: &mut Builder<'_>, p5z: bool) -> bool {
         *TEST_IMAGE.lock().unwrap() = image;
-        unsafe { zstd_mount_join(image.len() as u64, test_read, b) }
+        unsafe { zstd_mount_join(image.len() as u64, test_read, b, p5z) }
+    }
+
+    /// `image` with the chunks of each volume laid out backwards (the
+    /// volume's last chunk id at byte 64, then the one before it, back to
+    /// back), every volume still exactly full: what a `.p5z` that grew by
+    /// appending can hold. The payload CRC is sealed again.
+    fn backwards(image: &[u8]) -> Vec<u8> {
+        let mut out = image.to_vec();
+        let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let (count, chunks_at) = (u64_at(&out, 48) as usize, u64_at(&out, 64) as usize);
+        let volumes = u32::from_le_bytes(out[20..24].try_into().unwrap()) as usize;
+        let mut ends = vec![VOLUME_HEADER_SIZE as u64; volumes];
+        for id in (0..count).rev() {
+            let at = chunks_at + 8 * id;
+            let c = u64_at(&out, at);
+            let v = ((c >> 32) & 0xfff) as usize;
+            let moved = (c & !0xffff_ffff) | ends[v];
+            ends[v] += ((c >> 44) & 0x3ffff) + 1;
+            out[at..at + 8].copy_from_slice(&moved.to_le_bytes());
+        }
+        let crc = ampr_format::crc32(&out[128..]);
+        out[112..116].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// p5z mode mounts an index whose chunks sit out of record order and
+    /// zstd mode refuses it. The p5z mount's sorted copy of the chunks is
+    /// the chunk part of the tables block, filled in chunk order after the
+    /// open: the mounted tables are the index's, and the release gives
+    /// back every byte, as after the refused zstd mount.
+    #[test]
+    fn a_p5z_mount_takes_chunks_in_any_order() {
+        use ampr_format::zstd::Rules;
+        use std::sync::atomic::Ordering::SeqCst;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<String> = (0..600).map(|n| format!("dir/file-{n:03}.bin")).collect();
+        let mut files: Vec<(&str, u64)> = names
+            .iter()
+            .map(|n| (n.as_str(), 1 + n.len() as u64))
+            .collect();
+        files.push(("Data/B.bin", 300_000));
+        let image: &'static [u8] = backwards(&build_index(&files, ("Data/B.bin", 1))).leak();
+        assert!(Index::open(image).is_err());
+        let chunks = files.len() + 1;
+        let mut sorted = vec![0u64; chunks];
+        let plain = Index::open_p5z(image, &mut sorted).unwrap();
+        assert_eq!((plain.chunk_count() as usize, plain.volume_count()), (chunks, 2));
+        let paths: Vec<Vec<u8>> = files
+            .iter()
+            .map(|(p, _)| format!("/app0/{p}").into_bytes())
+            .collect();
+        let ampr: Vec<(&[u8], u64)> = paths
+            .iter()
+            .zip(&files)
+            .map(|(p, f)| (p.as_slice(), f.1))
+            .collect();
+        let mut idx = crate::rt::index::tests::zstd_builder(&ampr);
+        TEST_FAIL.store(false, SeqCst);
+        unsafe {
+            let used = im::test_index_used();
+            let b = idx.compact.builder.as_mut().unwrap();
+            assert!(!mount_image_as(image, b, false));
+            assert!((*ZSTD_MOUNT.get()).index.is_none());
+            zstd_mount_release();
+            assert_eq!(im::test_index_used(), used);
+
+            assert!(mount_image_as(image, b, true));
+            let mount = &*ZSTD_MOUNT.get();
+            assert_eq!(mount.tables_bytes, table_bytes(chunks as u64, 2));
+            let index = mount.index.as_ref().unwrap();
+            assert_eq!(index.rules(), Rules::P5z);
+            assert!(index.has_chunks());
+            for id in 0..=chunks as u32 {
+                assert_eq!(index.chunk(id), plain.chunk(id), "chunk {id}");
+            }
+            for v in 0..3 {
+                assert_eq!(index.volume_size(v), plain.volume_size(v));
+            }
+            zstd_mount_release();
+            assert!((*ZSTD_MOUNT.get()).index.is_none());
+            assert_eq!(im::test_index_used(), used);
+        }
+        crate::rt::index::tests::drop_view(&mut idx);
+    }
+
+    /// A p5z mount needs the Index room a zstd mount needs and not a byte
+    /// more: with exactly the tables and the windows left it mounts, the
+    /// tables its only block once mounted; with a page less it is refused
+    /// with the index notice after reading only the header, as in zstd
+    /// mode.
+    #[test]
+    fn a_p5z_mount_needs_no_room_beyond_its_tables() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _pool = im::POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 3000usize;
+        let names: Vec<String> = (0..n).map(|i| format!("d{}/f{i}.bin", i % 7)).collect();
+        let files: Vec<(&str, u64)> = names.iter().map(|p| (p.as_str(), 1)).collect();
+        let image: &'static [u8] = backwards(&build_index(&files, ("", u32::MAX))).leak();
+        assert!(Index::open(image).is_err());
+        let paths: Vec<Vec<u8>> = names
+            .iter()
+            .map(|p| format!("/app0/{p}").into_bytes())
+            .collect();
+        let ampr: Vec<(&[u8], u64)> = paths.iter().map(|p| (p.as_slice(), 1)).collect();
+        let used = im::test_index_used();
+        let mut idx = crate::rt::index::tests::zstd_builder(&ampr);
+        let page = SCE_KERNEL_PAGE_SIZE;
+        let tables = table_bytes(n as u64, 1).next_multiple_of(page);
+        TEST_FAIL.store(false, SeqCst);
+        im::test_take_index_notice();
+        unsafe {
+            let b = idx.compact.builder.as_mut().unwrap();
+            let before = im::test_index_used();
+            for (short, tag) in [(page, c"test.p5z.short"), (0, c"test.p5z.exact")] {
+                let fill = im::index_room() - (tables + 2 * WINDOW) + short;
+                let other = im::index_alloc(fill, page, tag.as_ptr());
+                assert!(!other.is_null());
+                TEST_READS.store(0, SeqCst);
+                let mounted = mount_image_as(image, b, true);
+                if short > 0 {
+                    assert!(!mounted);
+                    assert_eq!(TEST_READS.load(SeqCst), 1, "only the header is read");
+                    assert!(im::test_take_index_notice());
+                } else {
+                    assert!(mounted);
+                    assert!(!im::test_take_index_notice());
+                    assert_eq!(im::test_index_used(), before + fill + tables);
+                    assert!((*ZSTD_MOUNT.get()).index.as_ref().unwrap().has_chunks());
+                }
+                zstd_mount_release();
+                im::index_free(other.cast(), c"test.p5z.free".as_ptr());
+                assert_eq!(im::test_index_used(), before);
+            }
+        }
+        crate::rt::index::tests::drop_view(&mut idx);
+        assert_eq!(im::test_index_used(), used);
     }
 
     /// A zstd index mounts only with its chunk and volume tables and the

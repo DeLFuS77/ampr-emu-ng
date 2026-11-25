@@ -216,6 +216,8 @@ unsafe fn validate_data_header_zstd(
     } {
         return false;
     }
+    // Under the rules the index was mounted with: in p5z mode a header
+    // written before the .p5z grew may count fewer volumes.
     if ampr_format::zstd::volume_header(&header, index, volume).is_err() {
         return false;
     }

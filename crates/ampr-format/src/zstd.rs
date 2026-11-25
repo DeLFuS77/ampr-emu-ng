@@ -46,10 +46,28 @@ pub enum Rules {
     /// volumes.
     Pack,
     /// `Index::open_p5z`, p5z mode (docs/p5z-mode.md), whose `.p5z`
-    /// MaxPack can grow by appending: the chunks of each volume cover
-    /// [64, size) exactly, with no gap and no overlap, in any order, and a
-    /// volume header may count fewer volumes than the index.
+    /// MaxPack can grow by appending: the chunks of each volume sit in
+    /// [64, size) in any order, with room between them allowed and no
+    /// overlap, and a volume header may count fewer volumes than the
+    /// index.
     P5z,
+}
+
+/// Why `Index::open_p5z` refused an index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum P5zOpenError {
+    /// A check every index makes (`Index::open`'s error).
+    Index(Error),
+    /// Two chunks of `volume` overlap.
+    Overlap { volume: u32 },
+    /// A chunk of `volume` runs past its end.
+    PastEnd { volume: u32 },
+}
+
+impl From<Error> for P5zOpenError {
+    fn from(e: Error) -> Self {
+        Self::Index(e)
+    }
 }
 
 /// Reads records through `src` at absolute table offsets, so the same
@@ -172,12 +190,17 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     }
 
     /// `open` under `Rules::P5z`: the chunks may sit in their volumes in
-    /// any order, as long as each volume's chunks cover [64, size)
-    /// exactly. `sorted` holds one u64 per chunk (the header's chunk
-    /// count, else `Invalid`) for a sorted copy of where they sit; what it
-    /// holds afterwards is unspecified.
-    pub fn open_p5z(src: &'s S, sorted: &mut [u64]) -> Result<Self> {
-        Self::open_with(src, Some(sorted))
+    /// any order, with room between them, as long as no two overlap and
+    /// each one stays inside its volume. `sorted` holds one u64 per chunk
+    /// (the header's chunk count, else `Index(Invalid)`) for a sorted copy
+    /// of where they sit; what it holds afterwards is unspecified.
+    pub fn open_p5z(
+        src: &'s S,
+        sorted: &mut [u64],
+    ) -> core::result::Result<Self, P5zOpenError> {
+        let index = Self::open_with(src, Some(&mut *sorted))?;
+        index.check_placement(sorted)?;
+        Ok(index)
     }
 
     fn open_with(src: &'s S, sorted: Option<&mut [u64]>) -> Result<Self> {
@@ -490,8 +513,10 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
                 return Err(Error::Invalid);
             }
         }
-        if let Some(sorted) = sorted {
-            return self.check_tiling(sorted);
+        // `Rules::P5z`: `open_p5z` checks where the chunks sit, from
+        // `sorted`.
+        if sorted.is_some() {
+            return Ok(());
         }
         if self.volume_count > 0
             && (current_volume + 1 != self.volume_count
@@ -503,29 +528,30 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     }
 
     /// `Rules::P5z`, after the record pass filled `sorted` with every
-    /// chunk's `tile_key`: sorted by volume and offset, the chunks of each
-    /// volume cover [64, size) back to back, and every volume holds one
-    /// chunk at least, as under `Rules::Pack`. The record pass already
-    /// refused a chunk in a volume past the count. Sorts in place: no
-    /// memory but `sorted`.
-    fn check_tiling(&self, sorted: &mut [u64]) -> Result<()> {
+    /// chunk's `tile_key`: sorted by volume and offset, no chunk starts
+    /// before the end of the one before it, and the last one ends inside
+    /// its volume. Room between chunks, or a volume with no chunk, is
+    /// allowed: it is what files an update changed or removed leave. The
+    /// record pass already refused a chunk in a volume past the count or
+    /// inside the volume header. Sorts in place: no memory but `sorted`.
+    fn check_placement(&self, sorted: &mut [u64]) -> core::result::Result<(), P5zOpenError> {
         sorted.sort_unstable();
         let mut chunks = sorted.iter().map(|&k| untile_key(k)).peekable();
         for volume in 0..self.volume_count {
             let mut end = VOLUME_HEADER_SIZE as u64;
             while let Some((_, offset, stored)) = chunks.next_if(|c| c.0 == volume) {
-                if offset != end {
-                    return Err(Error::Invalid);
+                if offset < end {
+                    return Err(P5zOpenError::Overlap { volume });
                 }
                 // A u32 offset plus at most 256 KiB: no overflow.
                 end = offset + stored;
             }
-            if end == VOLUME_HEADER_SIZE as u64 || end != self.volume_size(volume)? {
-                return Err(Error::Invalid);
+            if end > self.volume_size(volume)? {
+                return Err(P5zOpenError::PastEnd { volume });
             }
         }
         match chunks.next() {
-            Some(_) => Err(Error::Invalid),
+            Some(_) => Err(P5zOpenError::Index(Error::Invalid)),
             None => Ok(()),
         }
     }
@@ -1073,8 +1099,8 @@ mod tests {
         out
     }
 
-    /// Whether `bytes` opens with `Index::open` and with `Index::open_p5z`.
-    fn open_both(bytes: &[u8]) -> (Result<()>, Result<()>) {
+    /// How `bytes` opens with `Index::open` and with `Index::open_p5z`.
+    fn open_both(bytes: &[u8]) -> (Result<()>, core::result::Result<(), P5zOpenError>) {
         let (_, chunks, _) = header_counts(bytes).unwrap();
         let mut sorted = std::vec![0u64; chunks as usize];
         (
@@ -1089,7 +1115,19 @@ mod tests {
     const IN_ORDER: [&[u32]; 2] = [&[0, 1, 2], &[3, 4, 5]];
     /// Each volume full, its chunks in another order than the records'.
     const OUT_OF_ORDER: [&[u32]; 2] = [&[2, 0, 1], &[5, 3, 4]];
-    const BOTH_INVALID: (Result<()>, Result<()>) = (Err(Error::Invalid), Err(Error::Invalid));
+    const PACK_REFUSES: Result<()> = Err(Error::Invalid);
+    const P5Z_TAKES: core::result::Result<(), P5zOpenError> = Ok(());
+    /// Refused by a check every index makes, before where the chunks sit.
+    const BOTH_INVALID: (Result<()>, core::result::Result<(), P5zOpenError>) =
+        (PACK_REFUSES, Err(P5zOpenError::Index(Error::Invalid)));
+
+    fn overlap(volume: u32) -> (Result<()>, core::result::Result<(), P5zOpenError>) {
+        (PACK_REFUSES, Err(P5zOpenError::Overlap { volume }))
+    }
+
+    fn past_end(volume: u32) -> (Result<()>, core::result::Result<(), P5zOpenError>) {
+        (PACK_REFUSES, Err(P5zOpenError::PastEnd { volume }))
+    }
 
     #[test]
     fn chunks_in_record_order_open_with_both_rules() {
@@ -1119,11 +1157,7 @@ mod tests {
         ];
         for layout in layouts {
             let bytes = laid_out(&SIZES, &layout, |_, _| {});
-            assert_eq!(
-                open_both(&bytes),
-                (Err(Error::Invalid), Ok(())),
-                "{layout:?}"
-            );
+            assert_eq!(open_both(&bytes), (PACK_REFUSES, P5Z_TAKES), "{layout:?}");
         }
     }
 
@@ -1136,8 +1170,7 @@ mod tests {
         let layout: [&[u32]; 2] = [&backwards, &[n]];
         let sizes = [u64::from(n) * CHUNK_SIZE, 10];
         let bytes = laid_out(&sizes, &layout, |_, _| {});
-        let index = Index::open(&bytes[..]);
-        assert_eq!(index.err(), Some(Error::Invalid));
+        assert_eq!(open_both(&bytes), (PACK_REFUSES, P5Z_TAKES));
         let mut sorted = std::vec![0u64; n as usize + 1];
         let index = Index::open_p5z(&bytes[..], &mut sorted).unwrap();
         assert_eq!(index.volume_size(0), Ok(64 + u64::from(n) * CHUNK_SIZE));
@@ -1145,39 +1178,50 @@ mod tests {
         assert_eq!(index.chunk(0).unwrap().offset, 64 + (n - 1) * (1 << 18));
         // One byte short: the first chunk runs past the volume's end.
         let short = laid_out(&sizes, &layout, |_, v| v[0] -= 1);
-        assert_eq!(open_both(&short), BOTH_INVALID);
+        assert_eq!(open_both(&short), past_end(0));
     }
 
+    /// The room a file left when an update changed or removed it: a hole
+    /// between chunks, at the start or the end of a volume, or a whole
+    /// volume with no chunk. p5z rules take it; pack rules do not.
     #[test]
-    fn a_gap_is_refused_with_both_rules() {
-        // The last chunk of volume 0 one byte late, the volume one byte
-        // longer: a one-byte hole before it.
-        let bytes = laid_out(&SIZES, &IN_ORDER, |c, v| {
-            c[2] += 1;
-            v[0] += 1;
-        });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
-        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
-            c[1] += 1;
-            v[0] += 1;
-        });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
-        // A hole at the start of a volume, right after its header.
-        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
-            for i in [5, 3, 4] {
-                c[i] += 1;
-            }
-            v[1] += 1;
-        });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
-        // A volume one byte longer than its chunks.
-        for layout in [IN_ORDER, OUT_OF_ORDER] {
-            let bytes = laid_out(&SIZES, &layout, |_, v| v[1] += 1);
-            assert_eq!(open_both(&bytes), BOTH_INVALID);
+    fn a_hole_or_an_empty_volume_opens_with_p5z_rules_only() {
+        let holes: [(&str, [&[u32]; 2], fn(&mut [u64], &mut [u64])); 6] = [
+            // The last chunk of volume 0 one byte late, the volume one byte
+            // longer.
+            ("between chunks", IN_ORDER, |c, v| {
+                c[2] += 1;
+                v[0] += 1;
+            }),
+            ("between chunks", OUT_OF_ORDER, |c, v| {
+                c[1] += 1;
+                v[0] += 1;
+            }),
+            ("after the header", OUT_OF_ORDER, |c, v| {
+                for i in [5, 3, 4] {
+                    c[i] += 1;
+                }
+                v[1] += 1;
+            }),
+            ("at the end", IN_ORDER, |_, v| v[1] += 1),
+            ("at the end", OUT_OF_ORDER, |_, v| v[1] += 1),
+            // Chunk 0 written again at the end of volume 1, as an update
+            // does: its old place in volume 0 is a hole.
+            ("where a chunk was", OUT_OF_ORDER, |c, v| {
+                c[0] = (c[0] & !(0xfff_ffff_ffff)) | (1 << 32) | v[1];
+                v[1] += SIZES[0];
+            }),
+        ];
+        for (what, layout, edit) in holes {
+            let bytes = laid_out(&SIZES, &layout, edit);
+            assert_eq!(open_both(&bytes), (PACK_REFUSES, P5Z_TAKES), "{what} {layout:?}");
         }
-        // A volume that holds no chunk: a header with nothing after it.
-        let bytes = laid_out(&SIZES, &[&[0, 1, 2], &[], &[3, 4, 5]], |_, _| {});
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        // A volume that holds no chunk: only its header, or room that
+        // every file in it left.
+        for size in [64, 64 + 10_000] {
+            let bytes = laid_out(&SIZES, &[&[0, 1, 2], &[], &[3, 4, 5]], |_, v| v[1] = size);
+            assert_eq!(open_both(&bytes), (PACK_REFUSES, P5Z_TAKES), "{size}");
+        }
     }
 
     #[test]
@@ -1188,18 +1232,22 @@ mod tests {
             c[2] -= 1;
             v[0] -= 1;
         });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        assert_eq!(open_both(&bytes), overlap(0));
         let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
             c[1] -= 1;
             v[0] -= 1;
         });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        assert_eq!(open_both(&bytes), overlap(0));
+        // One byte early inside volume 1: an overlap before it, a hole after.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, _| c[3] -= 1);
+        assert_eq!(open_both(&bytes), overlap(1));
         // Two chunks at one offset: chunk 0 moved onto chunk 2.
         let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, _| {
             c[0] = (c[0] & !0xffff_ffff) | (c[2] & 0xffff_ffff);
         });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
-        // The first chunk of a volume inside its header.
+        assert_eq!(open_both(&bytes), overlap(0));
+        // The first chunk of a volume inside its header: the chunk record
+        // itself is refused.
         let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
             for i in [2, 0, 1] {
                 c[i] -= 1;
@@ -1213,7 +1261,7 @@ mod tests {
     fn a_chunk_past_its_volume_is_refused_with_both_rules() {
         for layout in [IN_ORDER, OUT_OF_ORDER] {
             let bytes = laid_out(&SIZES, &layout, |_, v| v[1] -= 1);
-            assert_eq!(open_both(&bytes), BOTH_INVALID, "{layout:?}");
+            assert_eq!(open_both(&bytes), past_end(1), "{layout:?}");
         }
         // A chunk of volume 0 moved past its end, into what would be
         // volume 1's room.
@@ -1221,7 +1269,10 @@ mod tests {
             c[1] += v[1];
             v[0] -= SIZES[1];
         });
-        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        assert_eq!(open_both(&bytes), past_end(0));
+        // Volume 0 ends where its last chunk starts.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |_, v| v[0] -= SIZES[1]);
+        assert_eq!(open_both(&bytes), past_end(0));
     }
 
     #[test]
@@ -1244,15 +1295,15 @@ mod tests {
             let mut sorted = std::vec![0u64; n];
             assert_eq!(
                 Index::open_p5z(&bytes[..], &mut sorted).err(),
-                Some(Error::Invalid),
+                Some(P5zOpenError::Index(Error::Invalid)),
                 "{n}"
             );
         }
         // Every other check still runs: a payload CRC, a codec, a total.
         let mut bad = bytes.clone();
         bad[200] ^= 1;
-        let checksum = Err(Error::Checksum);
-        assert_eq!(open_both(&bad), (checksum, checksum));
+        let checksum = (Err(Error::Checksum), Err(P5zOpenError::Index(Error::Checksum)));
+        assert_eq!(open_both(&bad), checksum);
         let zstd_tail = laid_out(&SIZES, &OUT_OF_ORDER, |c, _| c[2] |= 1 << 62);
         assert_eq!(open_both(&zstd_tail), BOTH_INVALID);
     }

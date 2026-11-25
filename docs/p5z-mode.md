@@ -138,20 +138,23 @@ only there, ampr-emu-ng checks these instead (`Rules::P5z` in
 `crates/ampr-format/src/zstd.rs`):
 
 - **Where the chunks sit.** A zstd pack fills each volume from byte 64
-  in record order. The new index sorts its records by path hash again, old
-  files and new together, so their chunks no longer come in that order. In
-  p5z mode the chunks of each volume must cover `[64, size)` exactly, with
-  no hole and no overlap, in any order, and every volume must hold one
-  chunk at least.
+  in record order, back to back. The new index sorts its records by path
+  hash again, old files and new together, so their chunks no longer come
+  in that order, and the files an update changed or removed leave room in
+  the old volumes that no chunk uses any more (a volume can end up with no
+  chunk at all). In p5z mode the chunks of each volume may sit in any order
+  and with room between them, as long as no two overlap and each one lies
+  inside `[64, size)` of its volume. A read is still bounded by its own
+  chunk record, so the unused room is never read.
 - **The volume count in a volume header.** A header written before the
   `.p5z` grew counts the volumes it had then. In p5z mode a header's count
   may be lower than the index's, never higher; its id, archive id and
   size must still match.
 
 Every other check is the same: codec, sizes, store-only, volume ids below
-the count, the sums and the CRCs. The order check sorts a copy of the
-chunk records (8 B per chunk) in the chunk part of the block that then
-holds the chunk and volume tables, taken before the open and filled
+the count, the sums and the CRCs. The overlap check sorts a copy of
+the chunk records (8 B per chunk) in the chunk part of the block that
+then holds the chunk and volume tables, taken before the open and filled
 after it, so p5z mode needs no Index room beyond those tables; an index
 whose tables do not fit is refused as in zstd mode. Without
 `maxpack.image` nothing changes: a zstd pack is checked by the rules in

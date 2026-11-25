@@ -4,7 +4,10 @@
 use ampr_format::p5z::{
     check_header, check_region, file_offset, parse_image, P5zError, Region, MAX_VOLUMES,
 };
-use ampr_format::zstd::{header_volumes, volume_header, volume_header_for, Index, Rules};
+use ampr_format::zstd::{
+    header_volumes, volume_header, volume_header_for, Index, P5zOpenError, Rules,
+};
+use ampr_format::Error;
 
 const P5Z: &[u8] = include_bytes!("fixtures/p5z/basic.p5z");
 const INDEX: &[u8] = include_bytes!("fixtures/p5z/ampr_zstd.index");
@@ -320,8 +323,9 @@ fn backwards(index: &[u8]) -> Vec<u8> {
 }
 
 /// The real seven-volume index with its chunks moved, each volume still
-/// exactly full: p5z rules open it, pack rules do not. One byte of hole,
-/// of overlap, or a chunk in a volume past the count, and neither does.
+/// exactly full: p5z rules open it, pack rules do not. With a hole too,
+/// p5z rules still open it; with an overlap, a chunk past its volume's end
+/// or in a volume past the count, neither does.
 #[test]
 fn multi_fixture_with_chunks_out_of_order_opens_with_p5z_rules_only() {
     let moved = backwards(M_INDEX);
@@ -342,9 +346,8 @@ fn multi_fixture_with_chunks_out_of_order_opens_with_p5z_rules_only() {
         assert_eq!(index.volume_size(k), original.volume_size(k));
     }
 
-    // The first two chunks of volume 0 as laid out: the first one byte
-    // later (a hole before it) or earlier (inside the volume header), the
-    // second one byte earlier (an overlap), or the first in volume 7 of 7.
+    // Copies of it, broken or holed, as an update could leave them. The
+    // first two chunks of volume 0 as laid out, and its last one.
     let at_offset = |offset: u32| {
         (0..n as u32)
             .find(|&id| {
@@ -353,23 +356,44 @@ fn multi_fixture_with_chunks_out_of_order_opens_with_p5z_rules_only() {
             })
             .unwrap()
     };
+    let size0 = index.volume_size(0).unwrap();
     let first = at_offset(64);
     let second = at_offset(64 + index.chunk(first).unwrap().stored_size);
+    let last = (0..n as u32)
+        .find(|&id| {
+            let c = index.chunk(id).unwrap();
+            c.volume_id == 0 && u64::from(c.offset) + u64::from(c.stored_size) == size0
+        })
+        .unwrap();
     let chunks_at = u64::from_le_bytes(moved[64..72].try_into().unwrap()) as usize;
-    let edits: [(&str, u32, fn(u64) -> u64); 4] = [
-        ("hole", first, |c| c + 1),
-        ("into the header", first, |c| c - 1),
-        ("overlap", second, |c| c - 1),
-        ("volume 7", first, |c| (c & !(0xfff << 32)) | (7 << 32)),
+    let volumes_at = u64::from_le_bytes(moved[72..80].try_into().unwrap()) as usize;
+    use P5zOpenError::{Overlap, PastEnd};
+    let invalid = Err(P5zOpenError::Index(Error::Invalid));
+    let edits: [(&str, u32, fn(u64) -> u64, u64, Result<(), P5zOpenError>); 6] = [
+        // The last chunk one byte later in a volume one byte longer.
+        ("a hole", last, |c| c + 1, 1, Ok(())),
+        ("past the end", last, |c| c + 1, 0, Err(PastEnd { volume: 0 })),
+        ("onto the next one", first, |c| c + 1, 0, Err(Overlap { volume: 0 })),
+        ("onto the one before", second, |c| c - 1, 0, Err(Overlap { volume: 0 })),
+        ("into the header", first, |c| c - 1, 0, invalid),
+        (
+            "in volume 7 of 7",
+            first,
+            |c| (c & !(0xfff << 32)) | (7 << 32),
+            0,
+            invalid,
+        ),
     ];
-    for (what, id, edit) in edits {
+    for (what, id, edit, longer, p5z) in edits {
         let at = chunks_at + 8 * id as usize;
         let mut broken = moved.clone();
         let c = u64::from_le_bytes(broken[at..at + 8].try_into().unwrap());
         broken[at..at + 8].copy_from_slice(&edit(c).to_le_bytes());
+        broken[volumes_at..volumes_at + 8].copy_from_slice(&(size0 + longer).to_le_bytes());
         let crc = ampr_format::crc32(&broken[128..]);
         broken[112..116].copy_from_slice(&crc.to_le_bytes());
         assert!(Index::open(&broken[..]).is_err(), "{what}");
-        assert!(Index::open_p5z(&broken[..], &mut sorted).is_err(), "{what}");
+        let opened = Index::open_p5z(&broken[..], &mut sorted).map(|_| ());
+        assert_eq!(opened, p5z, "{what}");
     }
 }

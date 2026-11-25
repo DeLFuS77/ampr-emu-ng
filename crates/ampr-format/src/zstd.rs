@@ -36,16 +36,19 @@ pub struct ChunkRecord {
     pub codec: u8,
 }
 
-/// The rules an index was opened with.
+/// The rules an index was opened with, which its volume headers are
+/// checked by too (`volume_header`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rules {
     /// `Index::open`, every zstd pack: the chunks fill each volume from
     /// byte 64 in record order (files in record order, chunks in file
-    /// order), back to back.
+    /// order), back to back, and each volume header counts the index's
+    /// volumes.
     Pack,
     /// `Index::open_p5z`, p5z mode (docs/p5z-mode.md), whose `.p5z`
     /// MaxPack can grow by appending: the chunks of each volume cover
-    /// [64, size) exactly, with no gap and no overlap, in any order.
+    /// [64, size) exactly, with no gap and no overlap, in any order, and a
+    /// volume header may count fewer volumes than the index.
     P5z,
 }
 
@@ -586,7 +589,8 @@ pub fn header_volumes(h: &[u8]) -> Result<HeaderVolumes> {
 }
 
 /// Parses a 64-byte header, or the first 64 bytes of a complete volume, and
-/// matches it to the checked index and its declared size for volume `id`.
+/// matches it to the checked index and its declared size for volume `id`,
+/// under the rules the index was opened with.
 pub fn volume_header<S: Source + ?Sized>(
     bytes: &[u8],
     index: &Index<'_, S>,
@@ -598,22 +602,31 @@ pub fn volume_header<S: Source + ?Sized>(
         index.volume_count(),
         index.archive_id(),
         index.volume_size(id)?,
+        index.rules(),
     )
 }
 
 /// `volume_header` against the index's values instead of a mounted index:
 /// volume `id` of `count`, of archive `archive_id`, `volume_size` bytes
-/// with its header. The p5z start-up check runs it before the mount.
+/// with its header. Under `Rules::Pack` the header counts `count` volumes;
+/// under `Rules::P5z` at most `count`, since a header written before the
+/// `.p5z` grew counts the volumes it had then. The p5z start-up check runs
+/// it before the mount.
 pub fn volume_header_for(
     bytes: &[u8],
     id: u32,
     count: u32,
     archive_id: &[u8; 16],
     volume_size: u64,
+    rules: Rules,
 ) -> Result<VolumeHeader> {
     let header = format::decode_volume_header(bytes).map_err(|_| Error::Invalid)?;
+    let count_ok = match rules {
+        Rules::Pack => header.count == count,
+        Rules::P5z => header.count <= count,
+    };
     if header.id != id
-        || header.count != count
+        || !count_ok
         || header.archive_id != *archive_id
         || header.payload_bytes.checked_add(VOLUME_HEADER_SIZE as u64) != Some(volume_size)
     {
@@ -1267,24 +1280,71 @@ mod tests {
         let id = *index.archive_id();
         let good = volume_bytes(0, 1, id, size - VOLUME_HEADER_SIZE as u64);
         let header = volume_header(&good, &index, 0).unwrap();
-        assert_eq!(volume_header_for(&good, 0, 1, &id, size), Ok(header));
+        let pack = Rules::Pack;
+        assert_eq!(volume_header_for(&good, 0, 1, &id, size, pack), Ok(header));
         let mut other = id;
         other[3] ^= 1;
         for bad in [
-            volume_header_for(&good, 1, 1, &id, size),
-            volume_header_for(&good, 0, 2, &id, size),
-            volume_header_for(&good, 0, 1, &other, size),
-            volume_header_for(&good, 0, 1, &id, size + 1),
-            volume_header_for(&good[..63], 0, 1, &id, size),
+            volume_header_for(&good, 1, 1, &id, size, pack),
+            volume_header_for(&good, 0, 2, &id, size, pack),
+            volume_header_for(&good, 0, 1, &other, size, pack),
+            volume_header_for(&good, 0, 1, &id, size + 1, pack),
+            volume_header_for(&good[..63], 0, 1, &id, size, pack),
         ] {
             assert_eq!(bad, Err(Error::Invalid));
         }
         let mut flipped = good;
         flipped[50] ^= 1;
         assert_eq!(
-            volume_header_for(&flipped, 0, 1, &id, size),
+            volume_header_for(&flipped, 0, 1, &id, size, pack),
             Err(Error::Invalid)
         );
         assert_eq!(volume_header(&good, &index, 1), Err(Error::OutOfRange));
+    }
+
+    /// A volume header written before the `.p5z` grew counts fewer volumes
+    /// than the index: p5z rules take it, pack rules do not. Everything
+    /// else in it must still match, with either rules.
+    #[test]
+    fn p5z_rules_take_a_volume_header_that_counts_fewer_volumes() {
+        let bytes = laid_out(&SIZES, &IN_ORDER, |_, _| {});
+        let pack = Index::open(&bytes[..]).unwrap();
+        let mut sorted = [0u64; SIZES.len()];
+        let p5z = Index::open_p5z(&bytes[..], &mut sorted).unwrap();
+        let id = *pack.archive_id();
+        let size = |v| pack.volume_size(v).unwrap();
+        let header = |v: u32, count| volume_bytes(v, count, id, size(v) - 64);
+        // Volume 0 as written when the archive had one volume.
+        let older = header(0, 1);
+        assert_eq!(volume_header(&older, &pack, 0), Err(Error::Invalid));
+        let at_most = volume_header_for(&older, 0, 2, &id, size(0), Rules::Pack);
+        assert_eq!(at_most, Err(Error::Invalid));
+        let taken = volume_header(&older, &p5z, 0).unwrap();
+        assert_eq!((taken.id, taken.count), (0, 1));
+        let at_most = volume_header_for(&older, 0, 2, &id, size(0), Rules::P5z);
+        assert_eq!(at_most, Ok(taken));
+        // The index's own count passes with both rules.
+        for index in [&pack, &p5z] {
+            assert!(volume_header(&header(0, 2), index, 0).is_ok());
+            assert!(volume_header(&header(1, 2), index, 1).is_ok());
+        }
+        // More volumes than the index, another archive, another volume's
+        // id, another size: refused with both rules.
+        let mut other = id;
+        other[0] ^= 1;
+        let wrong = [
+            header(0, 3),
+            volume_bytes(0, 1, other, size(0) - 64),
+            volume_bytes(1, 2, id, size(0) - 64),
+            volume_bytes(0, 1, id, size(0) - 65),
+        ];
+        for (n, bytes) in wrong.iter().enumerate() {
+            for index in [&pack, &p5z] {
+                let rules = index.rules();
+                assert_eq!(volume_header(bytes, index, 0), Err(Error::Invalid), "{n} {rules:?}");
+                let checked = volume_header_for(bytes, 0, 2, &id, size(0), rules);
+                assert_eq!(checked, Err(Error::Invalid), "{n} {rules:?}");
+            }
+        }
     }
 }

@@ -14,8 +14,8 @@ use ampr_format::p5z::{
     check_header, check_region, parse_image, P5zError, Region, IMAGE_MAX_BYTES, MAX_VOLUMES,
 };
 use ampr_format::zstd::{
-    header_volumes, volume_header_for, HeaderVolumes, INDEX_HEADER_SIZE, VOLUME_HEADER_SIZE,
-    VOLUME_RECORD_SIZE,
+    header_volumes, volume_header_for, HeaderVolumes, Rules, INDEX_HEADER_SIZE,
+    VOLUME_HEADER_SIZE, VOLUME_RECORD_SIZE,
 };
 use core::ptr::copy_nonoverlapping;
 
@@ -307,7 +307,7 @@ fn check_volumes<D: P5zDisk>(
         let volume_size = u64::from_le_bytes(record);
         check_region(k, region, size, volume_size).map_err(P5zFail::Check)?;
         if !d.pread_full(fd, &mut h, region.start)
-            || volume_header_for(&h, k, v.count, &v.archive_id, volume_size).is_err()
+            || volume_header_for(&h, k, v.count, &v.archive_id, volume_size, Rules::Pack).is_err()
         {
             return Err(P5zFail::Check(P5zError::Volume(k)));
         }

@@ -114,16 +114,48 @@ order, and stops at the first failure:
    that size (`length == volume size`), starts at or after byte 64, and
    ends before the 32-byte footer at the end of the `.p5z` (no overflow).
 6. The first 64 bytes of each region are that volume's header: the
-   `ampr_format::zstd::volume_header` checks (id, count, archive id and
-   size match the index), here against the values read in 2 and 5
-   (`volume_header_for`).
+   `ampr_format::zstd::volume_header` checks (id, archive id and size
+   match the index, and the volume count is at most the index's: see
+   [Growing a `.p5z`](#growing-a-p5z)), here against the values read in 2
+   and 5 (`volume_header_for`, p5z rules).
 
 The rest of `ampr_zstd.index` (its payload CRC, that its strings end the
 file, and every record) is checked when it is mounted, right after, still in module_start, as for any
-zstd title: if that fails no packed file is served, as in zstd mode, and
+zstd title, with p5z rules (`Index::open_p5z`): if that fails no packed
+file is served, as in zstd mode, and
 the notice already sent is the usual one. Each volume's first open checks
 its region and header again, against the mounted index and the size of
 the open `.p5z`, as a `.pak` is checked when it opens.
+
+## Growing a `.p5z`
+
+MaxPack can add files to a `.p5z` without packing it again (a DLC that
+comes out later, or the files a game update changes) by appending to it:
+new volumes, numbered after the old ones and with the same `archive_id`,
+then a new `ampr_zstd.index` and `ampr_emu.index`. Nothing before them is
+written again, so two rules of a zstd pack cannot hold, and in p5z mode,
+only there, ampr-emu-ng checks these instead (`Rules::P5z` in
+`crates/ampr-format/src/zstd.rs`):
+
+- **Where the chunks sit.** A zstd pack fills each volume from byte 64
+  in record order. The new index sorts its records by path hash again, old
+  files and new together, so their chunks no longer come in that order. In
+  p5z mode the chunks of each volume must cover `[64, size)` exactly, with
+  no hole and no overlap, in any order, and every volume must hold one
+  chunk at least.
+- **The volume count in a volume header.** A header written before the
+  `.p5z` grew counts the volumes it had then. In p5z mode a header's count
+  may be lower than the index's, never higher; its id, archive id and
+  size must still match.
+
+Every other check is the same: codec, sizes, store-only, volume ids below
+the count, the sums and the CRCs. The order check sorts a copy of the
+chunk records (8 B per chunk) in the chunk part of the block that then
+holds the chunk and volume tables, taken before the open and filled
+after it, so p5z mode needs no Index room beyond those tables; an index
+whose tables do not fit is refused as in zstd mode. Without
+`maxpack.image` nothing changes: a zstd pack is checked by the rules in
+`docs/zstd-format.md`.
 
 ## Reads
 

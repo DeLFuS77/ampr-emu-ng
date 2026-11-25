@@ -145,6 +145,11 @@ with that field zeroed. Chunks follow from offset 64 without padding, in
 index order (files in record order, chunks in file order), filling each
 volume to its recorded size. A file may continue in the next volume.
 
+p5z mode only (docs/p5z-mode.md, Growing a `.p5z`) also takes a `.p5z`
+that grew by appending: the chunks of each volume may sit in any order as
+long as they fill it exactly, and a volume header may count fewer volumes
+than the index. Everywhere else these rules stand as written here.
+
 ## Parallel reads
 
 Each chunk has its own frame and absolute offset, found in O(1).

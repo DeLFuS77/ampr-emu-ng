@@ -36,11 +36,25 @@ pub struct ChunkRecord {
     pub codec: u8,
 }
 
+/// The rules an index was opened with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rules {
+    /// `Index::open`, every zstd pack: the chunks fill each volume from
+    /// byte 64 in record order (files in record order, chunks in file
+    /// order), back to back.
+    Pack,
+    /// `Index::open_p5z`, p5z mode (docs/p5z-mode.md), whose `.p5z`
+    /// MaxPack can grow by appending: the chunks of each volume cover
+    /// [64, size) exactly, with no gap and no overlap, in any order.
+    P5z,
+}
+
 /// Reads records through `src` at absolute table offsets, so the same
 /// reader serves a resident image and the runtime's file sources, which
 /// read the index file at offsets.
 pub struct Index<'s, S: Source + ?Sized = [u8]> {
     src: &'s S,
+    rules: Rules,
     /// Resident chunk and volume tables, set by `with_chunks`; file
     /// records and paths stay in the source.
     tables: Option<(&'s [u64], &'s [u64])>,
@@ -149,7 +163,21 @@ impl Header {
 }
 
 impl<'s, S: Source + ?Sized> Index<'s, S> {
+    /// Opens and checks the whole index under `Rules::Pack`.
     pub fn open(src: &'s S) -> Result<Self> {
+        Self::open_with(src, None)
+    }
+
+    /// `open` under `Rules::P5z`: the chunks may sit in their volumes in
+    /// any order, as long as each volume's chunks cover [64, size)
+    /// exactly. `sorted` holds one u64 per chunk (the header's chunk
+    /// count, else `Invalid`) for a sorted copy of where they sit; what it
+    /// holds afterwards is unspecified.
+    pub fn open_p5z(src: &'s S, sorted: &mut [u64]) -> Result<Self> {
+        Self::open_with(src, Some(sorted))
+    }
+
+    fn open_with(src: &'s S, sorted: Option<&mut [u64]>) -> Result<Self> {
         let mut h = [0u8; INDEX_HEADER_SIZE];
         src.read_at(0, &mut h)?;
         let header = Header::read(&h)?;
@@ -161,6 +189,11 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         header.check(Some(src.len()))?;
         let index = Self {
             src,
+            rules: if sorted.is_some() {
+                Rules::P5z
+            } else {
+                Rules::Pack
+            },
             tables: None,
             files_at: header.files_off,
             file_count: header.file_count,
@@ -174,10 +207,13 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
             archive_id: header.archive_id,
             total_logical_bytes: header.total_logical_bytes,
         };
-        index.validate()?;
+        index.validate(sorted)?;
         Ok(index)
     }
 
+    pub fn rules(&self) -> Rules {
+        self.rules
+    }
     pub fn archive_id(&self) -> &[u8; 16] {
         &self.archive_id
     }
@@ -356,8 +392,16 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     }
 
     /// One pass over the records through the source. Two path buffers hold
-    /// the current and the previous path for the order check.
-    fn validate(&self) -> Result<()> {
+    /// the current and the previous path for the order check. Where the
+    /// chunks sit is checked in the same pass (`Rules::Pack`), or, given
+    /// `sorted` (`Rules::P5z`), after it (`check_tiling`).
+    fn validate(&self, mut sorted: Option<&mut [u64]>) -> Result<()> {
+        if sorted
+            .as_ref()
+            .is_some_and(|s| s.len() != self.chunk_count as usize)
+        {
+            return Err(Error::Invalid);
+        }
         let (mut next_chunk, mut next_string, mut logical_total) = (0u32, 0u64, 0u64);
         let mut bufs = [[0u8; PATH_BUF]; 2];
         let mut previous: Option<(u64, usize)> = None;
@@ -406,6 +450,12 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
                 {
                     return Err(Error::Invalid);
                 }
+                // `chunk` read `chunk_id`, so it is below the chunk count,
+                // which is `sorted`'s length.
+                if let Some(sorted) = sorted.as_deref_mut() {
+                    *sorted.get_mut(chunk_id as usize).ok_or(Error::Invalid)? = tile_key(&chunk);
+                    continue;
+                }
                 let volume = u32::from(chunk.volume_id);
                 if volume != current_volume {
                     if volume != current_volume + 1 || next_offset != current_size {
@@ -437,6 +487,9 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
                 return Err(Error::Invalid);
             }
         }
+        if let Some(sorted) = sorted {
+            return self.check_tiling(sorted);
+        }
         if self.volume_count > 0
             && (current_volume + 1 != self.volume_count
                 || next_offset != self.volume_size(current_volume)?)
@@ -445,6 +498,50 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
         }
         Ok(())
     }
+
+    /// `Rules::P5z`, after the record pass filled `sorted` with every
+    /// chunk's `tile_key`: sorted by volume and offset, the chunks of each
+    /// volume cover [64, size) back to back, and every volume holds one
+    /// chunk at least, as under `Rules::Pack`. The record pass already
+    /// refused a chunk in a volume past the count. Sorts in place: no
+    /// memory but `sorted`.
+    fn check_tiling(&self, sorted: &mut [u64]) -> Result<()> {
+        sorted.sort_unstable();
+        let mut chunks = sorted.iter().map(|&k| untile_key(k)).peekable();
+        for volume in 0..self.volume_count {
+            let mut end = VOLUME_HEADER_SIZE as u64;
+            while let Some((_, offset, stored)) = chunks.next_if(|c| c.0 == volume) {
+                if offset != end {
+                    return Err(Error::Invalid);
+                }
+                // A u32 offset plus at most 256 KiB: no overflow.
+                end = offset + stored;
+            }
+            if end == VOLUME_HEADER_SIZE as u64 || end != self.volume_size(volume)? {
+                return Err(Error::Invalid);
+            }
+        }
+        match chunks.next() {
+            Some(_) => Err(Error::Invalid),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Where a chunk sits, as one u64 that sorts by volume, then offset:
+/// volume id (12 bits) at bit 50, offset (32 bits) at bit 18, stored size
+/// less one (18 bits) at bit 0. The record's fields all fit, as unpacked.
+fn tile_key(c: &ChunkRecord) -> u64 {
+    (u64::from(c.volume_id) << 50) | (u64::from(c.offset) << 18) | u64::from(c.stored_size - 1)
+}
+
+/// `tile_key` back to (volume, offset, stored size).
+fn untile_key(k: u64) -> (u32, u64, u64) {
+    (
+        (k >> 50) as u32,
+        (k >> 18) & u64::from(u32::MAX),
+        (k & ((1 << 18) - 1)) + 1,
+    )
 }
 
 fn valid_path(path: &[u8]) -> bool {
@@ -879,6 +976,272 @@ mod tests {
             }
         }
         assert!(passed.is_empty(), "start-up passed: {passed:?}");
+    }
+
+    /// An index of raw files of `sizes` bytes, records in (hash, path)
+    /// order: record `i` is `sizes[i]` bytes, its chunks right after those
+    /// of the records before it. `layout[v]` lists the chunks volume `v`
+    /// holds, by chunk id, in the order they sit there: back to back from
+    /// byte 64, the volume ending with its last one. `edit` may change the
+    /// chunk records and the volume sizes before the CRCs are sealed.
+    fn laid_out(
+        sizes: &[u64],
+        layout: &[&[u32]],
+        edit: impl FnOnce(&mut [u64], &mut [u64]),
+    ) -> Vec<u8> {
+        let mut paths: Vec<(u64, Vec<u8>)> = (0..sizes.len())
+            .map(|i| std::format!("f{i}.bin").into_bytes())
+            .map(|p| (path_hash(&p), p))
+            .collect();
+        paths.sort();
+        let raw: Vec<u64> = sizes
+            .iter()
+            .flat_map(|&s| {
+                (0..s.div_ceil(CHUNK_SIZE)).map(move |n| (s - n * CHUNK_SIZE).min(CHUNK_SIZE))
+            })
+            .collect();
+        let mut chunks = std::vec![0u64; raw.len()];
+        let mut volumes = Vec::new();
+        for (v, ids) in layout.iter().enumerate() {
+            let mut offset = VOLUME_HEADER_SIZE as u64;
+            for &id in *ids {
+                let stored = raw[id as usize];
+                chunks[id as usize] = offset | ((v as u64) << 32) | ((stored - 1) << 44);
+                offset += stored;
+            }
+            volumes.push(offset);
+        }
+        edit(&mut chunks, &mut volumes);
+        let (mut recs, mut strings, mut first) = (Vec::new(), Vec::new(), 0u32);
+        for ((hash, path), &size) in paths.iter().zip(sizes) {
+            recs.extend_from_slice(&hash.to_le_bytes());
+            recs.extend_from_slice(&size.to_le_bytes());
+            recs.extend_from_slice(&first.to_le_bytes());
+            recs.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            recs.extend_from_slice(&(path.len() as u16).to_le_bytes());
+            recs.extend_from_slice(&[0; 6]);
+            strings.extend_from_slice(path);
+            first += size.div_ceil(CHUNK_SIZE) as u32;
+        }
+        let chunks_at = (INDEX_HEADER_SIZE + recs.len()) as u64;
+        let volumes_at = chunks_at + 8 * chunks.len() as u64;
+        let strings_at = volumes_at + 8 * volumes.len() as u64;
+        let mut out = std::vec![0u8; INDEX_HEADER_SIZE];
+        out.extend_from_slice(&recs);
+        chunks
+            .iter()
+            .chain(&volumes)
+            .for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
+        out.extend_from_slice(&strings);
+        let h = &mut out[..INDEX_HEADER_SIZE];
+        h[..8].copy_from_slice(INDEX_MAGIC);
+        h[8..12].copy_from_slice(&1u32.to_le_bytes());
+        h[12..16].copy_from_slice(&(INDEX_HEADER_SIZE as u32).to_le_bytes());
+        h[16] = CHUNK_SHIFT;
+        h[17] = 5;
+        h[20..24].copy_from_slice(&(volumes.len() as u32).to_le_bytes());
+        h[24..40].copy_from_slice(&[9; 16]);
+        for (at, value) in [
+            (40, sizes.len() as u64),
+            (48, chunks.len() as u64),
+            (56, INDEX_HEADER_SIZE as u64),
+            (64, chunks_at),
+            (72, volumes_at),
+            (80, strings_at),
+            (88, strings.len() as u64),
+            (96, sizes.iter().sum()),
+        ] {
+            h[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let header_crc = crc32(&out[..INDEX_HEADER_SIZE]);
+        let payload_crc = crc32(&out[INDEX_HEADER_SIZE..]);
+        out[112..116].copy_from_slice(&payload_crc.to_le_bytes());
+        out[116..120].copy_from_slice(&header_crc.to_le_bytes());
+        out
+    }
+
+    /// Whether `bytes` opens with `Index::open` and with `Index::open_p5z`.
+    fn open_both(bytes: &[u8]) -> (Result<()>, Result<()>) {
+        let (_, chunks, _) = header_counts(bytes).unwrap();
+        let mut sorted = std::vec![0u64; chunks as usize];
+        (
+            Index::open(bytes).map(|_| ()),
+            Index::open_p5z(bytes, &mut sorted).map(|_| ()),
+        )
+    }
+
+    /// One chunk per file; record 5 is a whole 256 KiB chunk, the largest
+    /// stored size.
+    const SIZES: [u64; 6] = [100, 2000, 30, 4096, 777, CHUNK_SIZE];
+    const IN_ORDER: [&[u32]; 2] = [&[0, 1, 2], &[3, 4, 5]];
+    /// Each volume full, its chunks in another order than the records'.
+    const OUT_OF_ORDER: [&[u32]; 2] = [&[2, 0, 1], &[5, 3, 4]];
+    const BOTH_INVALID: (Result<()>, Result<()>) = (Err(Error::Invalid), Err(Error::Invalid));
+
+    #[test]
+    fn chunks_in_record_order_open_with_both_rules() {
+        let bytes = laid_out(&SIZES, &IN_ORDER, |_, _| {});
+        assert_eq!(open_both(&bytes), (Ok(()), Ok(())));
+        let pack = Index::open(&bytes[..]).unwrap();
+        let mut sorted = [0u64; SIZES.len()];
+        let p5z = Index::open_p5z(&bytes[..], &mut sorted).unwrap();
+        assert_eq!((pack.rules(), p5z.rules()), (Rules::Pack, Rules::P5z));
+        for id in 0..=SIZES.len() as u32 {
+            assert_eq!(p5z.chunk(id), pack.chunk(id));
+        }
+        // An index with no chunk and no volume (one empty file).
+        assert_eq!(open_both(&laid_out(&[0], &[], |_, _| {})), (Ok(()), Ok(())));
+    }
+
+    /// What appending to a `.p5z` leaves: the records are re-sorted by
+    /// path hash, so their chunks no longer follow record order, and a
+    /// record's chunk can sit in an earlier volume than the one before it.
+    #[test]
+    fn chunks_out_of_record_order_open_with_p5z_rules_only() {
+        let layouts: [[&[u32]; 2]; 4] = [
+            OUT_OF_ORDER,
+            [&[3, 4, 5], &[0, 1, 2]],
+            [&[5, 0], &[1, 3, 2, 4]],
+            [&[4, 2, 0], &[1, 5, 3]],
+        ];
+        for layout in layouts {
+            let bytes = laid_out(&SIZES, &layout, |_, _| {});
+            assert_eq!(
+                open_both(&bytes),
+                (Err(Error::Invalid), Ok(())),
+                "{layout:?}"
+            );
+        }
+    }
+
+    /// Offsets up to the volume limit: a file of 16,383 whole chunks in
+    /// one volume of 4,294,705,216 bytes, its chunks laid out backwards.
+    #[test]
+    fn p5z_rules_sort_offsets_up_to_the_volume_limit() {
+        let n = 16_383u32;
+        let backwards: Vec<u32> = (0..n).rev().collect();
+        let layout: [&[u32]; 2] = [&backwards, &[n]];
+        let sizes = [u64::from(n) * CHUNK_SIZE, 10];
+        let bytes = laid_out(&sizes, &layout, |_, _| {});
+        let index = Index::open(&bytes[..]);
+        assert_eq!(index.err(), Some(Error::Invalid));
+        let mut sorted = std::vec![0u64; n as usize + 1];
+        let index = Index::open_p5z(&bytes[..], &mut sorted).unwrap();
+        assert_eq!(index.volume_size(0), Ok(64 + u64::from(n) * CHUNK_SIZE));
+        assert!(index.volume_size(0).unwrap() <= VOLUME_LIMIT);
+        assert_eq!(index.chunk(0).unwrap().offset, 64 + (n - 1) * (1 << 18));
+        // One byte short: the first chunk runs past the volume's end.
+        let short = laid_out(&sizes, &layout, |_, v| v[0] -= 1);
+        assert_eq!(open_both(&short), BOTH_INVALID);
+    }
+
+    #[test]
+    fn a_gap_is_refused_with_both_rules() {
+        // The last chunk of volume 0 one byte late, the volume one byte
+        // longer: a one-byte hole before it.
+        let bytes = laid_out(&SIZES, &IN_ORDER, |c, v| {
+            c[2] += 1;
+            v[0] += 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
+            c[1] += 1;
+            v[0] += 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        // A hole at the start of a volume, right after its header.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
+            for i in [5, 3, 4] {
+                c[i] += 1;
+            }
+            v[1] += 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        // A volume one byte longer than its chunks.
+        for layout in [IN_ORDER, OUT_OF_ORDER] {
+            let bytes = laid_out(&SIZES, &layout, |_, v| v[1] += 1);
+            assert_eq!(open_both(&bytes), BOTH_INVALID);
+        }
+        // A volume that holds no chunk: a header with nothing after it.
+        let bytes = laid_out(&SIZES, &[&[0, 1, 2], &[], &[3, 4, 5]], |_, _| {});
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+    }
+
+    #[test]
+    fn an_overlap_is_refused_with_both_rules() {
+        // The last chunk of volume 0 one byte early, the volume one byte
+        // shorter: it overlaps the chunk before it.
+        let bytes = laid_out(&SIZES, &IN_ORDER, |c, v| {
+            c[2] -= 1;
+            v[0] -= 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
+            c[1] -= 1;
+            v[0] -= 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        // Two chunks at one offset: chunk 0 moved onto chunk 2.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, _| {
+            c[0] = (c[0] & !0xffff_ffff) | (c[2] & 0xffff_ffff);
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+        // The first chunk of a volume inside its header.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
+            for i in [2, 0, 1] {
+                c[i] -= 1;
+            }
+            v[0] -= 1;
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+    }
+
+    #[test]
+    fn a_chunk_past_its_volume_is_refused_with_both_rules() {
+        for layout in [IN_ORDER, OUT_OF_ORDER] {
+            let bytes = laid_out(&SIZES, &layout, |_, v| v[1] -= 1);
+            assert_eq!(open_both(&bytes), BOTH_INVALID, "{layout:?}");
+        }
+        // A chunk of volume 0 moved past its end, into what would be
+        // volume 1's room.
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |c, v| {
+            c[1] += v[1];
+            v[0] -= SIZES[1];
+        });
+        assert_eq!(open_both(&bytes), BOTH_INVALID);
+    }
+
+    #[test]
+    fn a_chunk_in_a_volume_the_index_does_not_have_is_refused() {
+        for (layout, volume) in [(IN_ORDER, 2u64), (OUT_OF_ORDER, 2), (OUT_OF_ORDER, 4095)] {
+            // The last chunk of volume 1 in volume `volume`, of two.
+            let bytes = laid_out(&SIZES, &layout, |c, v| {
+                let last = layout[1][2] as usize;
+                c[last] = (c[last] & !(0xfff << 32)) | (volume << 32);
+                v[1] -= SIZES[last];
+            });
+            assert_eq!(open_both(&bytes), BOTH_INVALID, "{layout:?} {volume}");
+        }
+    }
+
+    #[test]
+    fn p5z_rules_need_one_sorted_slot_per_chunk() {
+        let bytes = laid_out(&SIZES, &OUT_OF_ORDER, |_, _| {});
+        for n in [0, SIZES.len() - 1, SIZES.len() + 1] {
+            let mut sorted = std::vec![0u64; n];
+            assert_eq!(
+                Index::open_p5z(&bytes[..], &mut sorted).err(),
+                Some(Error::Invalid),
+                "{n}"
+            );
+        }
+        // Every other check still runs: a payload CRC, a codec, a total.
+        let mut bad = bytes.clone();
+        bad[200] ^= 1;
+        let checksum = Err(Error::Checksum);
+        assert_eq!(open_both(&bad), (checksum, checksum));
+        let zstd_tail = laid_out(&SIZES, &OUT_OF_ORDER, |c, _| c[2] |= 1 << 62);
+        assert_eq!(open_both(&zstd_tail), BOTH_INVALID);
     }
 
     /// A 64-byte AMPRZDT1 header with its CRC.

@@ -153,8 +153,10 @@ only there, ampr-emu-ng checks these instead (`Rules::P5z` in
 
 Every other check is the same: codec, sizes, store-only, volume ids below
 the count, the sums and the CRCs. The overlap check sorts a copy of
-the chunk records (8 B per chunk) in the chunk part of the block that
-then holds the chunk and volume tables, taken before the open and filled
+the chunk records (8 B per chunk; an in-place heapsort with no
+recursion, `ampr_format::sort::sort_u64`, which skips keys already in
+order) in the chunk part of the block that then holds the chunk and
+volume tables, taken before the open and filled
 after it, so p5z mode needs no Index room beyond those tables; an index
 whose tables do not fit is refused as in zstd mode. Without
 `maxpack.image` nothing changes: a zstd pack is checked by the rules in

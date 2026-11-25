@@ -9,6 +9,7 @@ pub mod index_key;
 pub mod overlay;
 pub mod p5z;
 pub mod run;
+pub mod sort;
 pub mod source;
 pub mod view;
 pub mod view_join;

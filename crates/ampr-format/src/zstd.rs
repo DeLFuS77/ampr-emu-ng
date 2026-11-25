@@ -533,9 +533,10 @@ impl<'s, S: Source + ?Sized> Index<'s, S> {
     /// its volume. Room between chunks, or a volume with no chunk, is
     /// allowed: it is what files an update changed or removed leave. The
     /// record pass already refused a chunk in a volume past the count or
-    /// inside the volume header. Sorts in place: no memory but `sorted`.
+    /// inside the volume header. Sorts in place, with no recursion and no
+    /// memory but `sorted` (`sort_u64`).
     fn check_placement(&self, sorted: &mut [u64]) -> core::result::Result<(), P5zOpenError> {
-        sorted.sort_unstable();
+        crate::sort::sort_u64(sorted);
         let mut chunks = sorted.iter().map(|&k| untile_key(k)).peekable();
         for volume in 0..self.volume_count {
             let mut end = VOLUME_HEADER_SIZE as u64;

@@ -20,6 +20,10 @@ nothing. Tests: `crates/ampr-format/tests/p5z_fixture.rs`, with real
 The runtime side (the start-up check, the region table, the reads) is
 `crates/ampr-sys/src/rt/pack/p5z.rs`, whose tests run the check on the
 same fixture files and on broken copies of them.
+A third fixture, `crates/ampr-format/tests/fixtures/p5z-grown/`, is a real
+`.p5z` that grew by appending: `crates/ampr-format/tests/p5z_grown.rs`
+mounts it with p5z rules and reads every packed file back against the
+engine's SHA-256.
 
 The payload that mounts the game writes `maxpack.image` into `/app0` and
 mounts the folder that holds the `.p5z` read-only at `/app0/p5z/`. That

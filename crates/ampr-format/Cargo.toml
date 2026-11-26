@@ -14,3 +14,8 @@ ampr-zstd.path = "../ampr-zstd"
 # table). Already in the build through ampr-zstd, so no new crate; pinned
 # and `default-features = false` as there.
 crc32fast = { version = "=1.5.5", default-features = false }
+
+[dev-dependencies]
+# tests/p5z_grown.rs decodes the packed files of a real .p5z with the zstd
+# chunk decoder the PS5 uses. A path crate of the workspace, nothing new.
+ampr-codec.path = "../ampr-codec"

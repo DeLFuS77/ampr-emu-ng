@@ -17,6 +17,7 @@ version = "0.5.1"
 name = "ampr-format"
 version = "0.5.1"
 dependencies = [
+ "ampr-codec",
  "ampr-zstd",
  "crc32fast",
 ]

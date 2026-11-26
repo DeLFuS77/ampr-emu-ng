@@ -232,7 +232,7 @@ pre-release, whose notice reads `v<version>-beta.<commit>`.
 ## Quick start
 
 **With MaxPack for the console:** nothing to do. `maxpack.elf` carries this build
-(`v0.5.1-maxpack.1`) and copies it into each game's `fakelib/`: always for `.pkg` and `.p5z` games,
+(`v0.5.1-maxpack.2` from MaxPack for the console 1.0.2 on) and copies it into each game's `fakelib/`: always for `.pkg` and `.p5z` games,
 and for folder games through a setting that is on by default.
 
 **With ShadowMountPlus** (packed folders):

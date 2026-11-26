@@ -3,6 +3,17 @@
 What changed in each release of this copy of ampr-emu-ng. Releases are named
 `v<upstream version>-maxpack.<n>`: the upstream version they are built on and a MaxPack revision.
 
+## Unreleased
+
+Still based on upstream **v0.5.1**.
+
+- **Nothing recurses while a game starts.** The two sorts that still ran at module_start, on the
+  game's own thread, now use the heapsort of the p5z order check, whose stack use does not grow with
+  the list: the pack names of an LZ4 or pkg manifest, and the index's list of files whose path hashes
+  collide. With the standard library's sort, 1,024 pack names in the worst order could take 17.6 KiB
+  of that thread's stack; names already in file order never made it recurse, and no game is known to
+  have hit it. Both sorts give the same result as before.
+
 ## v0.5.1-maxpack.2
 
 Still based on upstream **v0.5.1**. Only the p5z mode changes; a game without a `maxpack.image` runs

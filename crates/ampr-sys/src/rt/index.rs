@@ -1056,6 +1056,13 @@ impl RuntimeBuilder {
                 ),
             )
         };
+        // This sort recurses, unlike the module_start ones (ampr_format::sort):
+        // the walk runs on the first thread that needs the index (a game
+        // thread or the reactor), never at module_start, which only loads.
+        // At most 2 * floor(log2(n)) + 1 levels of a 144 B frame, plus 1.3 KiB
+        // at the deepest: 7.5 KiB below 2^22 records, more than the Index
+        // ledger holds; a walk-ordered 1.34M-record test took 5.8 KiB on the
+        // host. A heapsort took 0.3-1.2 s longer on 0.8M-1.34M records there.
         records.sort_unstable_by(order);
         // Paths that fold to one key (case or separator variants) would make
         // the reload reject the image; keep the first of each run. Their path

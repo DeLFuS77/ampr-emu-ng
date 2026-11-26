@@ -335,6 +335,13 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   array unadjusted. Any change
   that grows runtime memory needs a measurement and an updated Makefile
   comment.
+- No recursion at module_start or in a pack mount, which run on a game
+  thread: sorts there use `ampr_format::sort` (heapsorts with no
+  recursion), not `core`'s `sort_unstable`, which recurses up to
+  2 * floor(log2(n)) + 1 levels (848 B a level for the 16-byte pack name
+  spans). The one recursive sort left is the walk build's (`save_image` in
+  `rt/index.rs`, its bound in a comment there), which never runs at
+  module_start. `tools/check_stack_frames.py` checks frames, not depth.
 - Comments: plain prose `//!` and `///`, saying why, with the measured numbers
   and the source they come from (e.g. `rt/stats.rs`). Large files group items under
   `// ---- topic ----` section lines; keep that style.

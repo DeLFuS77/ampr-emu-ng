@@ -6,10 +6,10 @@
 //! `core`'s `sort_unstable` recurses into one side of each partition, up to
 //! 2 * floor(log2(n)) + 1 levels. For the 16-byte name spans a level was
 //! 848 B (the small-sort scratch is inlined into it; release build, frames
-//! from its assembly): 17.6 KiB for the 1,024 packs a manifest may list in
-//! the worst order, called 8 KiB below module_start, so 26 KiB in all where
-//! the deepest module_start chain is otherwise about 16 KiB. A heapsort's
-//! frames here are under 100 B.
+//! from its assembly): up to 17.6 KiB for the 1,024 packs a manifest may
+//! list in the worst order, called about 9 KiB below module_start, so about
+//! 26.5 KiB in all, where the deepest module_start chain is otherwise about
+//! 17.5 KiB. A heapsort's frames here are under 100 B.
 
 /// Sorts `keys` ascending in place (`sort_by_key` on the keys themselves).
 /// Keys already in order, as the chunks of a `.p5z` that never grew are,

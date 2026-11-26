@@ -245,12 +245,12 @@ pub(crate) struct Span {
 /// Sorts `spans` by file offset and merges the ones that overlap or
 /// touch, in place, then numbers their bytes back to back. The merged
 /// count and their total bytes. It runs in the pack mount, at
-/// module_start: the sort is `ampr_format::sort::sort_by_key`, which does
+/// module_start: the sort is `ampr_format::sort::heapsort_by_key`, which does
 /// not recurse (`sort_unstable_by_key` could take up to 17.6 KiB of stack
 /// for 1,024 spans in the worst order). The merge does not depend on the
 /// order of spans with the same offset.
 pub(crate) fn merge_spans(spans: &mut [Span]) -> (usize, u32) {
-    ampr_format::sort::sort_by_key(spans, |s| s.at);
+    ampr_format::sort::heapsort_by_key(spans, |s| s.at);
     let mut n = 0usize;
     for i in 0..spans.len() {
         let s = spans[i];

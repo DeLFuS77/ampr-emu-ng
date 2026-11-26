@@ -332,7 +332,7 @@ pub fn build_sized<'a, S: Source + ?Sized>(
     }
     // In order for `collides` (a binary search). The build runs at
     // module_start: a sort that does not recurse (crate::sort).
-    crate::sort::sort_by_key(&mut b.collide[..b.collide_len], |&id| id);
+    crate::sort::heapsort_by_key(&mut b.collide[..b.collide_len], |&id| id);
     Ok(b)
 }
 

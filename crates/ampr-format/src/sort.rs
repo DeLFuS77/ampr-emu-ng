@@ -11,20 +11,21 @@
 //! 26.5 KiB in all, where the deepest module_start chain is otherwise about
 //! 17.5 KiB. A heapsort's frames here are under 100 B.
 
-/// Sorts `keys` ascending in place (`sort_by_key` on the keys themselves).
+/// Sorts `keys` ascending in place (`heapsort_by_key` on the keys themselves).
 /// Keys already in order, as the chunks of a `.p5z` that never grew are,
 /// cost one pass and are left as they are.
 pub fn sort_u64(keys: &mut [u64]) {
-    sort_by_key(keys, |&k| k);
+    heapsort_by_key(keys, |&k| k);
 }
 
-/// Sorts `v` ascending by `key`, in place: a heapsort, O(n log n), with no
-/// recursion and no memory but the slice, so its stack use does not grow
-/// with `v`. It is not stable: elements with equal keys may come out in
-/// any order, as with `sort_unstable_by_key`. A slice already in order
-/// costs one pass and is left as it is.
-pub fn sort_by_key<T, K: Ord>(v: &mut [T], mut key: impl FnMut(&T) -> K) {
-    if v.is_sorted_by_key(&mut key) {
+/// Sorts `v` ascending by `key`, in place, unstable: a heapsort, O(n log n),
+/// with no recursion and no memory but the slice, so its stack use does not
+/// grow with `v`. Elements with equal keys may come out in any order, as
+/// with `sort_unstable_by_key` and unlike the standard library's
+/// `sort_by_key`. A slice already in order costs one pass and is left as it
+/// is; a slice of zero-sized elements is left as it is.
+pub fn heapsort_by_key<T, K: Ord>(v: &mut [T], mut key: impl FnMut(&T) -> K) {
+    if core::mem::size_of::<T>() == 0 || v.is_sorted_by_key(&mut key) {
         return;
     }
     let n = v.len();
@@ -40,7 +41,8 @@ pub fn sort_by_key<T, K: Ord>(v: &mut [T], mut key: impl FnMut(&T) -> K) {
 /// Moves `v[root]` down the max-heap `v[..end]` (by `key`) to its place.
 fn sift_down<T, K: Ord>(v: &mut [T], mut root: usize, end: usize, key: &mut impl FnMut(&T) -> K) {
     loop {
-        // root < end <= isize::MAX, so 2 * root + 2 cannot overflow.
+        // T is not zero-sized (heapsort_by_key), so root < end <= isize::MAX
+        // and 2 * root + 2 cannot overflow.
         let mut child = 2 * root + 1;
         if child >= end {
             return;
@@ -133,14 +135,14 @@ mod tests {
         }
     }
 
-    /// `sort_by_key` on (key, tag) pairs, tags unique: the keys come out
+    /// `heapsort_by_key` on (key, tag) pairs, tags unique: the keys come out
     /// as the standard library's sort gives them, and every pair is still
     /// there, its tag with its own key. Equal keys may come out in any
     /// order, so the pairs are compared as sets.
     fn check_by_key(what: &str, keys: &[u64]) {
         let pairs: Vec<(u64, u32)> = keys.iter().zip(0u32..).map(|(&k, t)| (k, t)).collect();
         let mut got = pairs.clone();
-        sort_by_key(&mut got, |p| p.0);
+        heapsort_by_key(&mut got, |p| p.0);
         let mut want = keys.to_vec();
         want.sort();
         let got_keys: Vec<u64> = got.iter().map(|p| p.0).collect();
@@ -152,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_key_sorts_small_edge_adversarial_and_random_orders() {
+    fn heapsort_by_key_sorts_small_edge_adversarial_and_random_orders() {
         check_by_key("empty", &[]);
         check_by_key("one", &[7]);
         check_by_key("two backwards", &[2, 1]);
@@ -173,11 +175,11 @@ mod tests {
 
     /// Narrow keys sort as wide ones do, by a key taken from a field.
     #[test]
-    fn sort_by_key_sorts_u32_and_field_keys() {
+    fn heapsort_by_key_sorts_u32_and_field_keys() {
         for (what, keys) in orders(4_096) {
             let mut got: Vec<u32> = keys.iter().map(|&k| k as u32).collect();
             let mut want = got.clone();
-            sort_by_key(&mut got, |&k| k);
+            heapsort_by_key(&mut got, |&k| k);
             want.sort();
             assert_eq!(got, want, "{what}");
         }
@@ -197,7 +199,7 @@ mod tests {
             })
             .collect();
         let mut got = spans.clone();
-        sort_by_key(&mut got, |s| s.at);
+        heapsort_by_key(&mut got, |s| s.at);
         assert!(got.is_sorted_by_key(|s| s.at));
         let (mut a, mut b) = (got, spans);
         a.sort();
@@ -206,17 +208,31 @@ mod tests {
     }
 
     /// A slice already in order is left exactly as it is, equal keys
-    /// included, and costs one key call per element.
+    /// included, after one pass: at most two key calls per element, however
+    /// `core` counts them in `is_sorted_by_key` (a heapsort takes about
+    /// 2 * log2(n) per element).
     #[test]
-    fn sort_by_key_leaves_an_ordered_slice_as_it_is() {
+    fn heapsort_by_key_leaves_an_ordered_slice_as_it_is() {
         let pairs: Vec<(u64, u32)> = (0..1_000u32).map(|i| (u64::from(i / 10), 999 - i)).collect();
         let mut got = pairs.clone();
         let mut calls = 0usize;
-        sort_by_key(&mut got, |p| {
+        heapsort_by_key(&mut got, |p| {
             calls += 1;
             p.0
         });
         assert_eq!(got, pairs);
-        assert_eq!(calls, pairs.len());
+        assert!(calls <= 2 * pairs.len(), "{calls} key calls");
+    }
+
+    /// Zero-sized elements are all alike: nothing to sort, no key called.
+    #[test]
+    fn heapsort_by_key_leaves_zero_sized_elements_alone() {
+        let mut v = std::vec![(); 1_000];
+        let mut calls = 0usize;
+        heapsort_by_key(&mut v, |_| {
+            calls += 1;
+            0u8
+        });
+        assert_eq!((v.len(), calls), (1_000, 0));
     }
 }

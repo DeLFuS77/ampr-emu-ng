@@ -330,7 +330,9 @@ pub fn build_sized<'a, S: Source + ?Sized>(
         *dirs_needed = need;
         return Err(Error::OutOfRange);
     }
-    b.collide[..b.collide_len].sort_unstable();
+    // In order for `collides` (a binary search). The build runs at
+    // module_start: a sort that does not recurse (crate::sort).
+    crate::sort::sort_by_key(&mut b.collide[..b.collide_len], |&id| id);
     Ok(b)
 }
 

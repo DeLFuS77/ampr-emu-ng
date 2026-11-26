@@ -244,9 +244,13 @@ pub(crate) struct Span {
 
 /// Sorts `spans` by file offset and merges the ones that overlap or
 /// touch, in place, then numbers their bytes back to back. The merged
-/// count and their total bytes.
+/// count and their total bytes. It runs in the pack mount, at
+/// module_start: the sort is `ampr_format::sort::sort_by_key`, which does
+/// not recurse (`sort_unstable_by_key` took up to 17.6 KiB of stack for
+/// 1,024 spans out of order). The merge does not depend on the order of
+/// spans with the same offset.
 pub(crate) fn merge_spans(spans: &mut [Span]) -> (usize, u32) {
-    spans.sort_unstable_by_key(|s| s.at);
+    ampr_format::sort::sort_by_key(spans, |s| s.at);
     let mut n = 0usize;
     for i in 0..spans.len() {
         let s = spans[i];
@@ -608,5 +612,55 @@ mod tests {
         }
         assert_eq!(src.read_at(150, &mut out[..0]), Ok(()));
         assert_eq!(src.read_at(250, &mut out), Err(Error::Truncated));
+    }
+
+    /// Up to the 1,024 spans a manifest may list, in orders that make a
+    /// quicksort recurse or that repeat offsets: the merge gives what it
+    /// gives for the same spans in file order, and every byte of every
+    /// span is in exactly one merged span.
+    #[test]
+    fn merge_spans_takes_spans_in_any_order() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            x >> 33
+        };
+        let span = |at, len| Span { at, off: 0, len };
+        for kind in 0..6u64 {
+            for n in [0usize, 1, 2, 20, 21, 33, 500, 1_024] {
+                let spans: Vec<Span> = (0..n as u64)
+                    .map(|i| match kind {
+                        0 => span(64 + next() % 60_000, 1 + next() as u32 % 40),
+                        1 => span(64 + next() % 300, 1 + next() as u32 % 40),
+                        2 => span(64 + (n as u64 - i) * 33, 33),
+                        3 => span(64 + (i * 2_654_435_761) % 65_536, 8),
+                        4 => span(64 + (next() % 5) * 64, 1 + next() as u32 % 70),
+                        _ => span(64 + (i % 97) * 41, 41),
+                    })
+                    .collect();
+                let mut got = spans.clone();
+                let (n_got, total) = merge_spans(&mut got);
+                let mut want = spans.clone();
+                want.sort_by_key(|s| s.at);
+                let (n_want, total_want) = merge_spans(&mut want);
+                assert_eq!((n_got, total), (n_want, total_want), "kind {kind}, {n} spans");
+                assert_eq!(got[..n_got], want[..n_want], "kind {kind}, {n} spans");
+                let merged = &got[..n_got];
+                assert!(merged.windows(2).all(|w| w[0].at + u64::from(w[0].len) < w[1].at));
+                assert!(merged.windows(2).all(|w| w[0].off + w[0].len == w[1].off));
+                for s in &spans {
+                    let end = s.at + u64::from(s.len);
+                    let hits = merged
+                        .iter()
+                        .filter(|m| m.at <= s.at && end <= m.at + u64::from(m.len))
+                        .count();
+                    assert_eq!(hits, 1, "kind {kind}, {n} spans, span at {}", s.at);
+                }
+                let bytes: u64 = merged.iter().map(|m| u64::from(m.len)).sum();
+                assert_eq!(bytes, u64::from(total));
+            }
+        }
     }
 }
